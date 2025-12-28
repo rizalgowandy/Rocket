@@ -17,14 +17,18 @@ if [ "${1}" != "-d" ]; then
 fi
 
 # Generate the rustdocs for all of the crates.
-echo ":::: Generating the docs..."
+echo ":::: Generating docs (${DOC_VERSION})..."
 pushd "${PROJECT_ROOT}" > /dev/null 2>&1
   # Set the crate version and fill in missing doc URLs with docs.rs links.
-  RUSTDOCFLAGS="-Zunstable-options --crate-version ${DOC_VERSION}" \
-    cargo doc -p rocket \
-    -p rocket_sync_db_pools -p rocket_dyn_templates -p rocket_db_pools \
-    -Zrustdoc-map --no-deps --all-features
+  RUSTDOCFLAGS="-Z unstable-options \
+      --extern-html-root-url rocket=https://api.rocket.rs/${GIT_BRANCH}/rocket/ \
+      --crate-version ${DOC_VERSION} \
+      --enable-index-page \
+      --generate-link-to-definition" \
+      cargo doc -Zrustdoc-map --no-deps --all-features \
+        -p rocket \
+        -p rocket_db_pools \
+        -p rocket_sync_db_pools \
+        -p rocket_dyn_templates \
+        -p rocket_ws
 popd > /dev/null 2>&1
-
-# Blank index, for redirection.
-touch "${DOC_DIR}/index.html"

@@ -79,7 +79,6 @@
 //! ```
 
 use std::borrow::Cow;
-use std::convert::TryInto;
 use std::ops::{RangeBounds, Bound};
 use std::fmt::Debug;
 
@@ -160,7 +159,7 @@ crate::export! {
 
 /// Equality validator: succeeds exactly when `a` == `b`, using [`PartialEq`].
 ///
-/// On failure, returns a validation error with the following message:
+/// On error, returns a validation error with the following message:
 ///
 /// ```text
 /// value does not match expected value
@@ -237,7 +236,7 @@ pub fn dbg_eq<'v, A, B>(a: &A, b: B) -> Result<'v, ()>
 /// Negative equality validator: succeeds exactly when `a` != `b`, using
 /// [`PartialEq`].
 ///
-/// On failure, returns a validation error with the following message:
+/// On error, returns a validation error with the following message:
 ///
 /// ```text
 /// value is equal to an invalid value
@@ -362,7 +361,7 @@ impl<L, T: Len<L>> Len<L> for crate::serde::msgpack::MsgPack<T> {
 
 /// Length validator: succeeds when the length of a value is within a `range`.
 ///
-/// The value must implement [`Len`]. On failure, returns an [`InvalidLength`]
+/// The value must implement [`Len`]. On error, returns an [`InvalidLength`]
 /// error. See [`Len`] for supported types and how their length is computed.
 ///
 /// [`InvalidLength`]: crate::form::error::ErrorKind::InvalidLength
@@ -505,7 +504,7 @@ impl<I, T: Contains<I> + ?Sized> Contains<I> for &T {
 /// [`Contains<I>`](Contains) where `I` is the type of the `item`. See
 /// [`Contains`] for supported types and items.
 ///
-/// On failure, returns a validation error with the following message:
+/// On error, returns a validation error with the following message:
 ///
 /// ```text
 /// value is equal to an invalid value
@@ -591,7 +590,7 @@ pub fn dbg_contains<'v, V, I>(value: V, item: I) -> Result<'v, ()>
 /// [`Contains<I>`](Contains) where `I` is the type of the `item`. See
 /// [`Contains`] for supported types and items.
 ///
-/// On failure, returns a validation error with the following message:
+/// On error, returns a validation error with the following message:
 ///
 /// ```text
 /// value contains a disallowed item
@@ -671,7 +670,7 @@ pub fn dbg_omits<'v, V, I>(value: V, item: I) -> Result<'v, ()>
 /// Integer range validator: succeeds when an integer value is within a range.
 ///
 /// The value must be an integer type that implement `TryInto<isize> + Copy`. On
-/// failure, returns an [`OutOfRange`] error.
+/// error, returns an [`OutOfRange`] error.
 ///
 /// [`OutOfRange`]: crate::form::error::ErrorKind::OutOfRange
 ///
@@ -720,7 +719,7 @@ pub fn range<'v, V, R>(value: &V, range: R) -> Result<'v, ()>
 /// the `item`. The iterator must be [`Clone`]. See [`Contains`] for supported
 /// types and items. The item must be [`Debug`].
 ///
-/// On failure, returns a [`InvalidChoice`] error with the debug representation
+/// On error, returns a [`InvalidChoice`] error with the debug representation
 /// of each item in `items`.
 ///
 /// [`InvalidChoice`]: crate::form::error::ErrorKind::InvalidChoice
@@ -763,7 +762,7 @@ pub fn one_of<'v, V, I, R>(value: V, items: R) -> Result<'v, ()>
 /// File type validator: succeeds when a [`TempFile`] has the Content-Type
 /// `content_type`.
 ///
-/// On failure, returns a validation error with one of the following messages:
+/// On error, returns a validation error with one of the following messages:
 ///
 /// ```text
 /// // the file has an incorrect extension
@@ -808,10 +807,10 @@ pub fn ext<'v>(file: &TempFile<'_>, r#type: ContentType) -> Result<'v, ()> {
 /// With validator: succeeds when an arbitrary function or closure does.
 ///
 /// This is the most generic validator and, for readability, should only be used
-/// when a more case-specific option does not exist. It succeeds excactly when
+/// when a more case-specific option does not exist. It succeeds exactly when
 /// `f` returns `true` and fails otherwise.
 ///
-/// On failure, returns a validation error with the message `msg`.
+/// On error, returns a validation error with the message `msg`.
 ///
 /// # Example
 ///
@@ -859,9 +858,9 @@ pub fn with<'v, V, F, M>(value: V, f: F, msg: M) -> Result<'v, ()>
 /// _Try_ With validator: succeeds when an arbitrary function or closure does.
 ///
 /// Along with [`with`], this is the most generic validator. It succeeds
-/// excactly when `f` returns `Ok` and fails otherwise.
+/// exactly when `f` returns `Ok` and fails otherwise.
 ///
-/// On failure, returns a validation error with the message in the `Err`
+/// On error, returns a validation error with the message in the `Err`
 /// variant converted into a string.
 ///
 /// # Example

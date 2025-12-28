@@ -8,6 +8,7 @@ source "${SCRIPT_DIR}/config.sh"
 # Add Cargo to PATH.
 export PATH=${HOME}/.cargo/bin:${PATH}
 export CARGO_INCREMENTAL=0
+export RUSTC_BOOTSTRAP=1
 CARGO="cargo"
 
 # Checks that the versions for Cargo projects $@ all match
@@ -33,7 +34,7 @@ function check_versions_match() {
 function check_style() {
   # Ensure there are no tabs in any file.
   local tab=$(printf '\t')
-  local matches=$(git grep -E -I -n "${tab}" "${PROJECT_ROOT}" | grep -v 'LICENSE')
+  local matches=$(git grep -PIn "${tab}" "${PROJECT_ROOT}" | grep -v 'LICENSE')
   if ! [ -z "${matches}" ]; then
     echo "Tab characters were found in the following:"
     echo "${matches}"
@@ -42,7 +43,7 @@ function check_style() {
 
   # Ensure non-comment lines are under 100 characters.
   local n=100
-  local matches=$(git grep -P -I -n "(?=^..{$n,}$)(?!^\s*\/\/[\/!].*$).*" '*.rs')
+  local matches=$(git grep -PIn "(?=^..{$n,}$)(?!^\s*\/\/[\/!].*$).*" '*.rs')
   if ! [ -z "${matches}" ]; then
     echo "Lines longer than $n characters were found in the following:"
     echo "${matches}"
@@ -50,7 +51,7 @@ function check_style() {
   fi
 
   # Ensure there's no trailing whitespace.
-  local matches=$(git grep -E -I -n "\s+$" "${PROJECT_ROOT}" | grep -v -F '.stderr:')
+  local matches=$(git grep -PIn "\s+$" "${PROJECT_ROOT}" | grep -v -F '.stderr:')
   if ! [ -z "${matches}" ]; then
     echo "Trailing whitespace was found in the following:"
     echo "${matches}"
@@ -79,8 +80,9 @@ function test_contrib() {
     sqlx_mysql
     sqlx_postgres
     sqlx_sqlite
-    sqlx_mssql
     mongodb
+    diesel_mysql
+    diesel_postgres
   )
 
   SYNC_DB_POOLS_FEATURES=(
@@ -95,6 +97,11 @@ function test_contrib() {
   DYN_TEMPLATES_FEATURES=(
     tera
     handlebars
+    minijinja
+  )
+
+  WS_FEATURES=(
+    tungstenite
   )
 
   for feature in "${DB_POOLS_FEATURES[@]}"; do
@@ -111,17 +118,25 @@ function test_contrib() {
     echo ":: Building and testing dyn_templates [$feature]..."
     $CARGO test -p rocket_dyn_templates --no-default-features --features $feature $@
   done
+
+  for feature in "${WS_FEATURES[@]}"; do
+    echo ":: Building and testing ws [$feature]..."
+    $CARGO test -p rocket_ws --no-default-features --features $feature $@
+  done
 }
 
 function test_core() {
   FEATURES=(
+    tokio-macros
+    http2
+    http3-preview
     secrets
     tls
     mtls
-    http2
     json
     msgpack
     uuid
+    trace
   )
 
   echo ":: Building and checking core [no features]..."
@@ -144,7 +159,7 @@ function test_examples() {
   indir "${EXAMPLES_DIR}" $CARGO update
   ROCKET_SECRET_KEY="itlYmFR2vYKrOmFhupMIn/hyB6lYCCTXz4yaQX89XVg=" \
     indir "${EXAMPLES_DIR}" $CARGO test --all $@
-  }
+}
 
 function test_default() {
   echo ":: Building and testing core libraries..."
@@ -154,9 +169,23 @@ function test_default() {
   indir "${BENCHMARKS_ROOT}" $CARGO update
   indir "${BENCHMARKS_ROOT}" $CARGO check --benches --all-features $@
 
-  echo ":: Checking fuzzers..."
-  indir "${FUZZ_ROOT}" $CARGO update
-  indir "${FUZZ_ROOT}" $CARGO check --all --all-features $@
+  case "$OSTYPE" in
+      darwin* | linux*)
+          echo ":: Checking testbench..."
+          indir "${TESTBENCH_ROOT}" $CARGO update
+          indir "${TESTBENCH_ROOT}" $CARGO check $@
+
+          echo ":: Checking fuzzers..."
+          indir "${FUZZ_ROOT}" $CARGO update
+          indir "${FUZZ_ROOT}" $CARGO check --all --all-features $@
+          ;;
+      *) echo ":: Skipping testbench, fuzzers [$OSTYPE]" ;;
+  esac
+}
+
+function test_ui() {
+  echo ":: Testing compile-time UI output..."
+  indir "${PROJECT_ROOT}" $CARGO test --test ui-fail --all --all-features -- --ignored $@
 }
 
 function run_benchmarks() {
@@ -165,14 +194,48 @@ function run_benchmarks() {
   indir "${BENCHMARKS_ROOT}" $CARGO bench $@
 }
 
+function run_testbench() {
+  echo ":: Running testbench..."
+  indir "${TESTBENCH_ROOT}" $CARGO update
+  indir "${TESTBENCH_ROOT}" $CARGO run $@
+}
+
+# The kind of test we'll be running.
+TEST_KIND="default"
+KINDS=("default" "all" "core" "contrib" "examples" "benchmarks" "testbench" "ui")
+
+function print_help() {
+  echo "USAGE:"
+  echo "  $0 [+<TOOLCHAIN>] [--help|-h] [--<TEST>]"
+  echo ""
+  echo "OPTIONS:"
+  echo "  +<TOOLCHAIN>   Forwarded to Cargo to select toolchain."
+  echo "  --help, -h     Print this help message and exit."
+  echo "  --<TEST>       Run the specified test suite."
+  echo "                 (Run without --<TEST> to run default tests.)"
+
+  echo ""
+  echo "AVAILABLE <TEST> OPTIONS:"
+  for kind in "${KINDS[@]}"; do
+    echo "  ${kind}"
+  done
+
+  echo ""
+  echo "EXAMPLES:"
+  echo "  $0                     # Run default tests on current toolchain."
+  echo "  $0 +stable --all       # Run all tests on stable toolchain."
+  echo "  $0 --ui                # Run UI tests on current toolchain."
+}
+
 if [[ $1 == +* ]]; then
   CARGO="$CARGO $1"
   shift
 fi
 
-# The kind of test we'll be running.
-TEST_KIND="default"
-KINDS=("contrib" "benchmarks" "core" "examples" "default" "all")
+if [[ $1 == "--help" ]] || [[ $1 == "-h" ]]; then
+  print_help
+  exit 0
+fi
 
 if [[ " ${KINDS[@]} " =~ " ${1#"--"} " ]]; then
   TEST_KIND=${1#"--"}
@@ -191,7 +254,7 @@ echo ":: Ensuring contrib sync_db_pools versions match..."
 check_versions_match "${CONTRIB_SYNC_DB_POOLS_CRATE_ROOTS[@]}"
 
 echo ":: Ensuring contrib db_pools versions match..."
-check_versions_match "${CONTRIB_SYNC_DB_POOLS_CRATE_ROOTS[@]}"
+check_versions_match "${CONTRIB_DB_POOLS_CRATE_ROOTS[@]}"
 
 echo ":: Ensuring minimum style requirements are met..."
 check_style
@@ -207,17 +270,23 @@ case $TEST_KIND in
   examples) test_examples $@ ;;
   default) test_default $@ ;;
   benchmarks) run_benchmarks $@ ;;
+  testbench) run_testbench $@ ;;
+  ui) test_ui $@ ;;
   all)
     test_default $@ & default=$!
     test_examples $@ & examples=$!
     test_core $@ & core=$!
     test_contrib $@ & contrib=$!
+    run_testbench $@ & testbench=$!
+    test_ui $@ & ui=$!
 
     failures=()
     if ! wait $default ; then failures+=("DEFAULT"); fi
     if ! wait $examples ; then failures+=("EXAMPLES"); fi
     if ! wait $core ; then failures+=("CORE"); fi
     if ! wait $contrib ; then failures+=("CONTRIB"); fi
+    if ! wait $testbench ; then failures+=("TESTBENCH"); fi
+    if ! wait $ui ; then failures+=("UI"); fi
 
     if [ ${#failures[@]} -ne 0 ]; then
       tput setaf 1;

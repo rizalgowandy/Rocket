@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::{fmt, path};
 use std::borrow::Cow;
 
+use either::Either;
 use time::{macros::format_description, format_description::FormatItem};
 
 use crate::RawStr;
@@ -106,7 +107,7 @@ use crate::uri::fmt::{Part, Path, Query, Formatter};
 /// seen, the implementations will be used to display the value in a URI-safe
 /// manner.
 ///
-/// [`uri!`]: rocket::uri
+/// [`uri!`]: ../../../../rocket/macro.uri.html
 ///
 /// # Provided Implementations
 ///
@@ -198,8 +199,8 @@ use crate::uri::fmt::{Part, Path, Query, Formatter};
 /// assert_eq!(uri_string, "Bob%20Smith");
 /// ```
 ///
-/// As long as every field in the structure (or enum) implements `UriDisplay`,
-/// the trait can be derived. The implementation calls
+/// As long as every field in the structure (or enum for [`UriDisplay<Query>`])
+/// implements `UriDisplay`, the trait can be derived. The implementation calls
 /// [`Formatter::write_named_value()`] for every named field and
 /// [`Formatter::write_value()`] for every unnamed field. See the
 /// [`UriDisplay<Path>`] and [`UriDisplay<Query>`] derive documentation for full
@@ -421,6 +422,17 @@ impl<P: Part, T: UriDisplay<P> + ?Sized> UriDisplay<P> for &T {
     }
 }
 
+/// Defers to `T` or `U` in `Either<T, U>`.
+impl<P: Part, T: UriDisplay<P>, U: UriDisplay<P>> UriDisplay<P> for Either<T, U> {
+    #[inline(always)]
+    fn fmt(&self, f: &mut Formatter<'_, P>) -> fmt::Result {
+        match self {
+            Either::Left(t) => UriDisplay::fmt(t, f),
+            Either::Right(u) => UriDisplay::fmt(u, f),
+        }
+    }
+}
+
 /// Defers to the `UriDisplay<P>` implementation for `T`.
 impl<P: Part, T: UriDisplay<P> + ?Sized> UriDisplay<P> for &mut T {
     #[inline(always)]
@@ -453,11 +465,19 @@ impl<T: UriDisplay<Query>, E> UriDisplay<Query> for Result<T, E> {
 
 impl<T: UriDisplay<Query>> UriDisplay<Query> for Vec<T> {
     fn fmt(&self, f: &mut Formatter<'_, Query>) -> fmt::Result {
-        for value in self {
-            f.write_value(value)?;
-        }
+        self.iter().try_for_each(|v| f.write_value(v))
+    }
+}
 
-        Ok(())
+impl<T: UriDisplay<Query>, const N: usize> UriDisplay<Query> for [T; N] {
+    fn fmt(&self, f: &mut Formatter<'_, Query>) -> fmt::Result {
+        self.iter().try_for_each(|v| f.write_value(v))
+    }
+}
+
+impl UriDisplay<Query> for [u8] {
+    fn fmt(&self, f: &mut Formatter<'_, Query>) -> fmt::Result {
+        f.write_raw(RawStr::percent_encode_bytes(self).as_str())
     }
 }
 
@@ -497,8 +517,8 @@ impl<K: UriDisplay<Query>, V: UriDisplay<Query>> UriDisplay<Query> for BTreeMap<
     }
 }
 
-#[cfg(feature = "uuid")] impl_with_display!(uuid_::Uuid);
-#[cfg(feature = "uuid")] crate::impl_from_uri_param_identity!(uuid_::Uuid);
+#[cfg(feature = "uuid")] impl_with_display!(uuid::Uuid);
+#[cfg(feature = "uuid")] crate::impl_from_uri_param_identity!(uuid::Uuid);
 
 // And finally, the `Ignorable` trait, which has sugar of `_` in the `uri!`
 // macro, which expands to a typecheck.

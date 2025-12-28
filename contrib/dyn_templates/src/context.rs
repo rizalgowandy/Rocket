@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::error::Error;
 
-use crate::{Engines, TemplateInfo};
+use crate::engine::Engines;
+use crate::template::TemplateInfo;
 
 use rocket::http::ContentType;
 use normpath::PathExt;
@@ -26,6 +27,12 @@ impl Context {
     /// template engine, and store all of the initialized state in a `Context`
     /// structure, which is returned if all goes well.
     pub fn initialize(root: &Path, callback: &Callback) -> Option<Context> {
+        fn is_file_with_ext(entry: &walkdir::DirEntry, ext: &str) -> bool {
+            let is_file = entry.file_type().is_file();
+            let has_ext = entry.path().extension().map_or(false, |e| e == ext);
+            is_file && has_ext
+        }
+
         let root = match root.normalize() {
             Ok(root) => root.into_path_buf(),
             Err(e) => {
@@ -35,18 +42,24 @@ impl Context {
         };
 
         let mut templates: HashMap<String, TemplateInfo> = HashMap::new();
-        for ext in Engines::ENABLED_EXTENSIONS {
-            let mut glob_path = root.join("**").join("*");
-            glob_path.set_extension(ext);
-            let glob_path = glob_path.to_str().expect("valid glob path string");
+        for &ext in Engines::ENABLED_EXTENSIONS {
+            for entry in walkdir::WalkDir::new(&root).follow_links(true) {
+                let entry = match entry {
+                    Ok(entry) if is_file_with_ext(&entry, ext) => entry,
+                    Ok(_) | Err(_) => continue,
+                };
 
-            for path in glob::glob(glob_path).unwrap().filter_map(Result::ok) {
-                let (name, data_type_str) = split_path(&root, &path);
-                if let Some(info) = templates.get(&*name) {
-                    warn_!("Template name '{}' does not have a unique path.", name);
-                    info_!("Existing path: {:?}", info.path);
-                    info_!("Additional path: {:?}", path);
-                    warn_!("Using existing path for template '{}'.", name);
+                let (template, data_type_str) = split_path(&root, entry.path());
+                if let Some(info) = templates.get(&*template) {
+                    warn!(
+                        %template,
+                        first_path = %entry.path().display(),
+                        second_path = info.path.as_ref().map(|p| display(p.display())),
+                        data_type = %info.data_type,
+                        "Template name '{template}' can refer to multiple templates.\n\
+                         First path will be used. Second path is ignored."
+                    );
+
                     continue;
                 }
 
@@ -54,8 +67,8 @@ impl Context {
                     .and_then(|ext| ContentType::from_extension(ext))
                     .unwrap_or(ContentType::Text);
 
-                templates.insert(name, TemplateInfo {
-                    path: Some(path.clone()),
+                templates.insert(template, TemplateInfo {
+                    path: Some(entry.into_path()),
                     engine_ext: ext,
                     data_type,
                 });
@@ -63,9 +76,8 @@ impl Context {
         }
 
         let mut engines = Engines::init(&templates)?;
-        if let Err(e) = callback(&mut engines) {
-            error_!("Template customization callback failed.");
-            error_!("{}", e);
+        if let Err(reason) = callback(&mut engines) {
+            error!(%reason, "template customization callback failed");
             return None;
         }
 
@@ -73,7 +85,7 @@ impl Context {
             if !templates.contains_key(name) {
                 let data_type = Path::new(name).extension()
                     .and_then(|osstr| osstr.to_str())
-                    .and_then(|ext| ContentType::from_extension(ext))
+                    .and_then(ContentType::from_extension)
                     .unwrap_or(ContentType::Text);
 
                 let info = TemplateInfo { path: None, engine_ext, data_type };
@@ -88,7 +100,7 @@ impl Context {
 #[cfg(not(debug_assertions))]
 mod manager {
     use std::ops::Deref;
-    use crate::Context;
+    use super::Context;
 
     /// Wraps a Context. With `cfg(debug_assertions)` active, this structure
     /// additionally provides a method to reload the context at runtime.
@@ -115,7 +127,7 @@ mod manager {
     use std::sync::{RwLock, Mutex};
     use std::sync::mpsc::{channel, Receiver};
 
-    use notify::{raw_watcher, RawEvent, RecommendedWatcher, RecursiveMode, Watcher};
+    use notify::{recommended_watcher, Error, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
     use super::{Callback, Context};
 
@@ -125,23 +137,22 @@ mod manager {
         /// The current template context, inside an RwLock so it can be updated.
         context: RwLock<Context>,
         /// A filesystem watcher and the receive queue for its events.
-        watcher: Option<(RecommendedWatcher, Mutex<Receiver<RawEvent>>)>,
+        watcher: Option<(RecommendedWatcher, Mutex<Receiver<Result<Event, Error>>>)>,
     }
 
     impl ContextManager {
         pub fn new(ctxt: Context) -> ContextManager {
             let (tx, rx) = channel();
-            let watcher = raw_watcher(tx).and_then(|mut watcher| {
-                watcher.watch(ctxt.root.canonicalize()?, RecursiveMode::Recursive)?;
+            let watcher = recommended_watcher(tx).and_then(|mut watcher| {
+                watcher.watch(&ctxt.root.canonicalize()?, RecursiveMode::Recursive)?;
                 Ok(watcher)
             });
 
             let watcher = match watcher {
                 Ok(watcher) => Some((watcher, Mutex::new(rx))),
                 Err(e) => {
-                    warn!("Failed to enable live template reloading: {}", e);
-                    debug_!("Reload error: {:?}", e);
-                    warn_!("Live template reloading is unavailable.");
+                    warn!("live template reloading initialization failed: {e}\n\
+                        live template reloading is unavailable");
                     None
                 }
             };
@@ -170,13 +181,13 @@ mod manager {
                 .map(|(_, rx)| rx.lock().expect("fsevents lock").try_iter().count() > 0);
 
             if let Some(true) = templates_changes {
-                info_!("Change detected: reloading templates.");
+                debug!("template change detected: reloading templates");
                 let root = self.context().root.clone();
-                if let Some(new_ctxt) = Context::initialize(&root, &callback) {
+                if let Some(new_ctxt) = Context::initialize(&root, callback) {
                     *self.context_mut() = new_ctxt;
                 } else {
-                    warn_!("An error occurred while reloading templates.");
-                    warn_!("Existing templates will remain active.");
+                    warn!("error while reloading template\n\
+                        existing templates will remain active.")
                 };
             }
         }
@@ -206,7 +217,7 @@ fn split_path(root: &Path, path: &Path) -> (String, Option<String>) {
 
     // Ensure template name consistency on Windows systems
     if cfg!(windows) {
-        name = name.replace("\\", "/");
+        name = name.replace('\\', "/");
     }
 
     (name, data_type.map(|d| d.to_string_lossy().into_owned()))

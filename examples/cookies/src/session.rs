@@ -1,7 +1,7 @@
 use rocket::outcome::IntoOutcome;
 use rocket::request::{self, FlashMessage, FromRequest, Request};
 use rocket::response::{Redirect, Flash};
-use rocket::http::{Cookie, CookieJar};
+use rocket::http::{CookieJar, Status};
 use rocket::form::Form;
 
 use rocket_dyn_templates::{Template, context};
@@ -24,7 +24,7 @@ impl<'r> FromRequest<'r> for User {
             .get_private("user_id")
             .and_then(|cookie| cookie.value().parse().ok())
             .map(User)
-            .or_forward(())
+            .or_forward(Status::Unauthorized)
     }
 }
 
@@ -54,13 +54,13 @@ fn login(_user: User) -> Redirect {
 
 #[get("/login", rank = 2)]
 fn login_page(flash: Option<FlashMessage<'_>>) -> Template {
-    Template::render("login", &flash)
+    Template::render("login", flash)
 }
 
 #[post("/login", data = "<login>")]
 fn post_login(jar: &CookieJar<'_>, login: Form<Login<'_>>) -> Result<Redirect, Flash<Redirect>> {
     if login.username == "Sergio" && login.password == "password" {
-        jar.add_private(Cookie::new("user_id", 1.to_string()));
+        jar.add_private(("user_id", "1"));
         Ok(Redirect::to(uri!(index)))
     } else {
         Err(Flash::error(Redirect::to(uri!(login_page)), "Invalid username/password."))
@@ -69,7 +69,7 @@ fn post_login(jar: &CookieJar<'_>, login: Form<Login<'_>>) -> Result<Redirect, F
 
 #[post("/logout")]
 fn logout(jar: &CookieJar<'_>) -> Flash<Redirect> {
-    jar.remove_private(Cookie::named("user_id"));
+    jar.remove_private("user_id");
     Flash::success(Redirect::to(uri!(login_page)), "Successfully logged out.")
 }
 

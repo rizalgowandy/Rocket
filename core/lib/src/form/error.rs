@@ -3,6 +3,7 @@
 use std::{fmt, io};
 use std::num::{ParseIntError, ParseFloatError};
 use std::str::{Utf8Error, ParseBoolError};
+use std::char::ParseCharError;
 use std::net::AddrParseError;
 use std::borrow::Cow;
 
@@ -138,7 +139,7 @@ pub struct Error<'v> {
     pub value: Option<Cow<'v, str>>,
     /// The kind of error that occurred.
     pub kind: ErrorKind<'v>,
-    /// The entitiy that caused the error.
+    /// The entity that caused the error.
     pub entity: Entity,
 }
 
@@ -160,6 +161,7 @@ pub struct Error<'v> {
 ///   * [`AddrParseError`] => [`ErrorKind::Addr`]
 ///   * [`io::Error`] => [`ErrorKind::Io`]
 ///   * `Box<dyn std::error::Error + Send` => [`ErrorKind::Custom`]
+///   * `(Status, Box<dyn std::error::Error + Send)` => [`ErrorKind::Custom`]
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ErrorKind<'v> {
@@ -167,7 +169,7 @@ pub enum ErrorKind<'v> {
     InvalidLength {
         /// The minimum length required, inclusive.
         min: Option<u64>,
-        /// The maximum length required, inclusize.
+        /// The maximum length required, inclusive.
         max: Option<u64>,
     },
     /// The value wasn't one of the valid `choices`.
@@ -192,12 +194,15 @@ pub enum ErrorKind<'v> {
     Unexpected,
     /// An unknown entity was received.
     Unknown,
-    /// A custom error occurred.
-    Custom(Box<dyn std::error::Error + Send>),
+    /// A custom error occurred. Status defaults to
+    /// [`Status::UnprocessableEntity`] if one is not directly specified.
+    Custom(Status, Box<dyn std::error::Error + Send>),
     /// An error while parsing a multipart form occurred.
     Multipart(multer::Error),
     /// A string was invalid UTF-8.
     Utf8(Utf8Error),
+    /// A value failed to parse as a char.
+    Char(ParseCharError),
     /// A value failed to parse as an integer.
     Int(ParseIntError),
     /// A value failed to parse as a boolean.
@@ -210,7 +215,7 @@ pub enum ErrorKind<'v> {
     Io(io::Error),
 }
 
-/// The erranous form entity or form component.
+/// The erroneous form entity or form component.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Entity {
     /// The form itself.
@@ -348,7 +353,10 @@ impl<'v> Errors<'v> {
     /// Returns the highest [`Error::status()`] of all of the errors in `self`
     /// or [`Status::InternalServerError`] if `self` is empty. This is the
     /// status that is set by the [`Form`](crate::form::Form) data guard on
-    /// failure.
+    /// error.
+    ///
+    /// See [`Error::status()`] for the corresponding status code of each
+    /// [`Error`] variant.
     ///
     /// # Example
     ///
@@ -677,17 +685,19 @@ impl<'v> Error<'v> {
             .unwrap_or(false)
     }
 
-    /// Returns the most reasonable `Status` associated with this error. These
-    /// are:
+    /// Returns the most reasonable [`Status`] associated with this error.
     ///
-    ///  * **`PayloadTooLarge`** if the error kind is:
+    /// For an [`ErrorKind::Custom`], this is the variant's `Status`, which
+    /// defaults to [`Status::UnprocessableEntity`]. For all others, it is:
+    ///
+    ///  * **`PayloadTooLarge`** if the [error kind](ErrorKind) is:
     ///    - `InvalidLength` with min of `None`
-    ///    - `Multpart(FieldSizeExceeded | StreamSizeExceeded)`
-    ///  * **`InternalServerError`** if the error kind is:
+    ///    - `Multipart(FieldSizeExceeded)` or `Multipart(StreamSizeExceeded)`
+    ///  * **`InternalServerError`** if the [error kind](ErrorKind) is:
     ///    - `Unknown`
-    ///  * **`BadRequest`** if the error kind is:
+    ///  * **`BadRequest`** if the [error kind](ErrorKind) is:
     ///    - `Io` with an `entity` of `Form`
-    ///  * **`UnprocessableEntity`** otherwise
+    ///  * **`UnprocessableEntity`** for all other variants
     ///
     /// # Example
     ///
@@ -716,11 +726,12 @@ impl<'v> Error<'v> {
         use multer::Error::*;
 
         match self.kind {
-            InvalidLength { min: None, .. }
+            | InvalidLength { min: None, .. }
             | Multipart(FieldSizeExceeded { .. })
             | Multipart(StreamSizeExceeded { .. }) => Status::PayloadTooLarge,
             Unknown => Status::InternalServerError,
-            Io(_) | _ if self.entity == Entity::Form => Status::BadRequest,
+            Io(_) if self.entity == Entity::Form => Status::BadRequest,
+            Custom(status, _) => status,
             _ => Status::UnprocessableEntity
         }
     }
@@ -846,9 +857,10 @@ impl fmt::Display for ErrorKind<'_> {
             ErrorKind::Missing => "missing".fmt(f)?,
             ErrorKind::Unexpected => "unexpected".fmt(f)?,
             ErrorKind::Unknown => "unknown internal error".fmt(f)?,
-            ErrorKind::Custom(e) => e.fmt(f)?,
+            ErrorKind::Custom(_, e) => e.fmt(f)?,
             ErrorKind::Multipart(e) => write!(f, "invalid multipart: {}", e)?,
             ErrorKind::Utf8(e) => write!(f, "invalid UTF-8: {}", e)?,
+            ErrorKind::Char(e) => write!(f, "invalid character: {}", e)?,
             ErrorKind::Int(e) => write!(f, "invalid integer: {}", e)?,
             ErrorKind::Bool(e) => write!(f, "invalid boolean: {}", e)?,
             ErrorKind::Float(e) => write!(f, "invalid float: {}", e)?,
@@ -874,9 +886,10 @@ impl crate::http::ext::IntoOwned for ErrorKind<'_> {
             Missing => Missing,
             Unexpected => Unexpected,
             Unknown => Unknown,
-            Custom(e) => Custom(e),
+            Custom(s, e) => Custom(s, e),
             Multipart(e) => Multipart(e),
             Utf8(e) => Utf8(e),
+            Char(e) => Char(e),
             Int(e) => Int(e),
             Bool(e) => Bool(e),
             Float(e) => Float(e),
@@ -892,7 +905,6 @@ impl crate::http::ext::IntoOwned for ErrorKind<'_> {
     }
 }
 
-
 impl<'a, 'b> PartialEq<ErrorKind<'b>> for ErrorKind<'a> {
     fn eq(&self, other: &ErrorKind<'b>) -> bool {
         use ErrorKind::*;
@@ -904,7 +916,7 @@ impl<'a, 'b> PartialEq<ErrorKind<'b>> for ErrorKind<'a> {
             (Duplicate, Duplicate) => true,
             (Missing, Missing) => true,
             (Unexpected, Unexpected) => true,
-            (Custom(_), Custom(_)) => true,
+            (Custom(a, _), Custom(b, _)) => a == b,
             (Multipart(a), Multipart(b)) => a == b,
             (Utf8(a), Utf8(b)) => a == b,
             (Int(a), Int(b)) => a == b,
@@ -947,18 +959,24 @@ impl From<(Option<ByteUnit>, Option<ByteUnit>)> for ErrorKind<'_> {
     }
 }
 
-macro_rules! impl_from_choices {
-    ($($size:literal),*) => ($(
-        impl<'a, 'v: 'a> From<&'static [Cow<'v, str>; $size]> for ErrorKind<'a> {
-            fn from(choices: &'static [Cow<'v, str>; $size]) -> Self {
-                let choices = &choices[..];
-                ErrorKind::InvalidChoice { choices: choices.into() }
-            }
-        }
-    )*)
+impl<'a, 'v: 'a, const N: usize> From<&'static [Cow<'v, str>; N]> for ErrorKind<'a> {
+    fn from(choices: &'static [Cow<'v, str>; N]) -> Self {
+        let choices = &choices[..];
+        ErrorKind::InvalidChoice { choices: choices.into() }
+    }
 }
 
-impl_from_choices!(1, 2, 3, 4, 5, 6, 7, 8);
+impl<'a> From<Box<dyn std::error::Error + Send>> for ErrorKind<'a> {
+    fn from(e: Box<dyn std::error::Error + Send>) -> Self {
+        ErrorKind::Custom(Status::UnprocessableEntity, e)
+    }
+}
+
+impl<'a> From<(Status, Box<dyn std::error::Error + Send>)> for ErrorKind<'a> {
+    fn from((status, e): (Status, Box<dyn std::error::Error + Send>)) -> Self {
+        ErrorKind::Custom(status, e)
+    }
+}
 
 macro_rules! impl_from_for {
     (<$l:lifetime> $T:ty => $V:ty as $variant:ident) => (
@@ -972,11 +990,11 @@ macro_rules! impl_from_for {
 
 impl_from_for!(<'a> Utf8Error => ErrorKind<'a> as Utf8);
 impl_from_for!(<'a> ParseIntError => ErrorKind<'a> as Int);
+impl_from_for!(<'a> ParseCharError => ErrorKind<'a> as Char);
 impl_from_for!(<'a> ParseFloatError => ErrorKind<'a> as Float);
 impl_from_for!(<'a> ParseBoolError => ErrorKind<'a> as Bool);
 impl_from_for!(<'a> AddrParseError => ErrorKind<'a> as Addr);
 impl_from_for!(<'a> io::Error => ErrorKind<'a> as Io);
-impl_from_for!(<'a> Box<dyn std::error::Error + Send> => ErrorKind<'a> as Custom);
 
 impl fmt::Display for Entity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1012,10 +1030,11 @@ impl Entity {
             | ErrorKind::OutOfRange { .. }
             | ErrorKind::Validation { .. }
             | ErrorKind::Utf8(_)
+            | ErrorKind::Char(_)
             | ErrorKind::Int(_)
             | ErrorKind::Float(_)
             | ErrorKind::Bool(_)
-            | ErrorKind::Custom(_)
+            | ErrorKind::Custom(..)
             | ErrorKind::Addr(_) => Entity::Value,
 
             | ErrorKind::Duplicate

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, BTreeMap};
 use std::hash::Hash;
+use std::sync::Arc;
 
 use either::Either;
 use indexmap::IndexMap;
@@ -22,7 +23,7 @@ use crate::http::uncased::AsUncased;
 /// A form guard is a guard that operates on form fields, typically those with a
 /// particular name prefix. Form guards validate and parse form field data via
 /// implementations of `FromForm`. In other words, a type is a form guard _iff_
-/// it implements `FromFrom`.
+/// it implements `FromForm`.
 ///
 /// Form guards are used as the inner type of the [`Form`] data guard:
 ///
@@ -64,7 +65,7 @@ use crate::http::uncased::AsUncased;
 /// [FromFormField]: crate::form::FromFormField
 /// [`shift()`ed]: NameView::shift()
 /// [`key()`]: NameView::key()
-/// [forms guide]: https://rocket.rs/v0.5-rc/guide/requests/#forms
+/// [forms guide]: https://rocket.rs/master/guide/requests/#forms
 ///
 /// # Parsing Strategy
 ///
@@ -101,28 +102,33 @@ use crate::http::uncased::AsUncased;
 /// applications will never need a custom implementation of `FromForm` or
 /// `FromFormField`. Their behavior is documented in the table below.
 ///
-/// | Type               | Strategy    | Default           | Data   | Value  | Notes                                              |
-/// |--------------------|-------------|-------------------|--------|--------|----------------------------------------------------|
-/// | [`Strict<T>`]      | **strict**  | if `strict` `T`   | if `T` | if `T` | `T: FromForm`                                      |
-/// | [`Lenient<T>`]     | **lenient** | if `lenient` `T`  | if `T` | if `T` | `T: FromForm`                                      |
-/// | `Option<T>`        | **strict**  | `None`            | if `T` | if `T` | Infallible, `T: FromForm`                          |
-/// | [`Result<T>`]      | _inherit_   | `T::finalize()`   | if `T` | if `T` | Infallible, `T: FromForm`                          |
-/// | `Vec<T>`           | _inherit_   | `vec![]`          | if `T` | if `T` | `T: FromForm`                                      |
-/// | [`HashMap<K, V>`]  | _inherit_   | `HashMap::new()`  | if `V` | if `V` | `K: FromForm + Eq + Hash`, `V: FromForm`           |
-/// | [`BTreeMap<K, V>`] | _inherit_   | `BTreeMap::new()` | if `V` | if `V` | `K: FromForm + Ord`, `V: FromForm`                 |
-/// | `bool`             | _inherit_   | `false`           | No     | Yes    | `"yes"/"on"/"true"`, `"no"/"off"/"false"`          |
-/// | (un)signed int     | _inherit_   | **no default**    | No     | Yes    | `{u,i}{size,8,16,32,64,128}`                       |
-/// | _nonzero_ int      | _inherit_   | **no default**    | No     | Yes    | `NonZero{I,U}{size,8,16,32,64,128}`                |
-/// | float              | _inherit_   | **no default**    | No     | Yes    | `f{32,64}`                                         |
-/// | `&str`             | _inherit_   | **no default**    | Yes    | Yes    | Percent-decoded. Data limit `string` applies.      |
-/// | `String`           | _inherit_   | **no default**    | Yes    | Yes    | Exactly `&str`, but owned. Prefer `&str`.          |
-/// | IP Address         | _inherit_   | **no default**    | No     | Yes    | [`IpAddr`], [`Ipv4Addr`], [`Ipv6Addr`]             |
-/// | Socket Address     | _inherit_   | **no default**    | No     | Yes    | [`SocketAddr`], [`SocketAddrV4`], [`SocketAddrV6`] |
-/// | [`TempFile`]       | _inherit_   | **no default**    | Yes    | Yes    | Data limits apply. See [`TempFile`].               |
-/// | [`Capped<C>`]      | _inherit_   | **no default**    | Yes    | Yes    | `C` is `&str`, `String`, or `TempFile`.            |
-/// | [`time::Date`]     | _inherit_   | **no default**    | No     | Yes    | `%F` (`YYYY-MM-DD`). HTML "date" input.            |
-/// | [`time::DateTime`] | _inherit_   | **no default**    | No     | Yes    | `%FT%R` or `%FT%T` (`YYYY-MM-DDTHH:MM[:SS]`)       |
-/// | [`time::Time`]     | _inherit_   | **no default**    | No     | Yes    | `%R` or `%T` (`HH:MM[:SS]`)                        |
+/// | Type                   | Strategy    | Default           | Data   | Value  | Notes                                              |
+/// |------------------------|-------------|-------------------|--------|--------|----------------------------------------------------|
+/// | [`Strict<T>`]          | **strict**  | if `strict` `T`   | if `T` | if `T` | `T: FromForm`                                      |
+/// | [`Lenient<T>`]         | **lenient** | if `lenient` `T`  | if `T` | if `T` | `T: FromForm`                                      |
+/// | `Option<T>`            | **strict**  | `None`            | if `T` | if `T` | Infallible, `T: FromForm`                          |
+/// | [`Result<T>`]          | _inherit_   | `T::finalize()`   | if `T` | if `T` | Infallible, `T: FromForm`                          |
+/// | `Vec<T>`               | _inherit_   | `vec![]`          | if `T` | if `T` | `T: FromForm`                                      |
+/// | [`HashMap<K, V>`]      | _inherit_   | `HashMap::new()`  | if `V` | if `V` | `K: FromForm + Eq + Hash`, `V: FromForm`           |
+/// | [`BTreeMap<K, V>`]     | _inherit_   | `BTreeMap::new()` | if `V` | if `V` | `K: FromForm + Ord`, `V: FromForm`                 |
+/// | [`Range<T>`]           | _inherit_   | **no default**    | if `T` | if `T` | `T: FromForm`, expects `start`, `end` fields       |
+/// | [`RangeFrom<T>`]       | _inherit_   | **no default**    | if `T` | if `T` | `T: FromForm`, expects `start` field               |
+/// | [`RangeTo<T>`]         | _inherit_   | **no default**    | if `T` | if `T` | `T: FromForm`, expects `end` field                 |
+/// | [`RangeToInclusive<T>`]| _inherit_   | **no default**    | if `T` | if `T` | `T: FromForm`, expects `end` field                 |
+/// | `bool`                 | _inherit_   | `false`           | No     | Yes    | `"yes"/"on"/"true"`, `"no"/"off"/"false"`          |
+/// | (un)signed int         | _inherit_   | **no default**    | No     | Yes    | `{u,i}{size,8,16,32,64,128}`                       |
+/// | _nonzero_ int          | _inherit_   | **no default**    | No     | Yes    | `NonZero{I,U}{size,8,16,32,64,128}`                |
+/// | float                  | _inherit_   | **no default**    | No     | Yes    | `f{32,64}`                                         |
+/// | `&str`                 | _inherit_   | **no default**    | Yes    | Yes    | Percent-decoded. Data limit `string` applies.      |
+/// | `&[u8]`                | _inherit_   | **no default**    | Yes    | Yes    | Raw bytes. Data limit `bytes` applies.             |
+/// | `String`               | _inherit_   | **no default**    | Yes    | Yes    | Exactly `&str`, but owned. Prefer `&str`.          |
+/// | IP Address             | _inherit_   | **no default**    | No     | Yes    | [`IpAddr`], [`Ipv4Addr`], [`Ipv6Addr`]             |
+/// | Socket Address         | _inherit_   | **no default**    | No     | Yes    | [`SocketAddr`], [`SocketAddrV4`], [`SocketAddrV6`] |
+/// | [`TempFile`]           | _inherit_   | **no default**    | Yes    | Yes    | Data limits apply. See [`TempFile`].               |
+/// | [`Capped<C>`]          | _inherit_   | **no default**    | Yes    | Yes    | `C` is `&str`, `String`, `&[u8]` or `TempFile`.    |
+/// | [`time::Date`]         | _inherit_   | **no default**    | No     | Yes    | `%F` (`YYYY-MM-DD`). HTML "date" input.            |
+/// | [`time::DateTime`]     | _inherit_   | **no default**    | No     | Yes    | `%FT%R` or `%FT%T` (`YYYY-MM-DDTHH:MM[:SS]`)       |
+/// | [`time::Time`]         | _inherit_   | **no default**    | No     | Yes    | `%R` or `%T` (`HH:MM[:SS]`)                        |
 ///
 /// [`Result<T>`]: crate::form::Result
 /// [`Strict<T>`]: crate::form::Strict
@@ -138,6 +144,10 @@ use crate::http::uncased::AsUncased;
 /// [`SocketAddr`]: std::net::SocketAddr
 /// [`SocketAddrV4`]: std::net::SocketAddrV4
 /// [`SocketAddrV6`]: std::net::SocketAddrV6
+/// [`Range<T>`]: https://doc.rust-lang.org/stable/std/ops/struct.Range.html
+/// [`RangeFrom<T>`]: https://doc.rust-lang.org/stable/std/ops/struct.RangeFrom.html
+/// [`RangeTo<T>`]: https://doc.rust-lang.org/stable/std/ops/struct.RangeTo.html
+/// [`RangeToInclusive<T>`]: https://doc.rust-lang.org/stable/std/ops/struct.RangeToInclusive.html
 ///
 /// ## Additional Notes
 ///
@@ -410,7 +420,7 @@ use crate::http::uncased::AsUncased;
 /// }
 /// ```
 ///
-/// The lifetime `'r` correponds to the lifetime of the request.
+/// The lifetime `'r` corresponds to the lifetime of the request.
 ///
 /// ## A More Involved Example
 ///
@@ -484,7 +494,7 @@ use crate::http::uncased::AsUncased;
 ///     // Finally, we finalize `A` and `B`. If both returned `Ok` and we
 ///     // encountered no errors during the push phase, we return our pair. If
 ///     // there were errors, we return them. If `A` and/or `B` failed, we
-///     // return the commulative errors.
+///     // return the commutative errors.
 ///     fn finalize(mut ctxt: Self::Context) -> form::Result<'v, Self> {
 ///         match (A::finalize(ctxt.left), B::finalize(ctxt.right)) {
 ///             (Ok(l), Ok(r)) if ctxt.errors.is_empty() => Ok(Pair(l, r)),
@@ -563,6 +573,16 @@ pub struct VecContext<'v, T: FromForm<'v>> {
 }
 
 impl<'v, T: FromForm<'v>> VecContext<'v, T> {
+    fn new(opts: Options) -> Self {
+        VecContext {
+            opts,
+            last_key: None,
+            current: None,
+            items: vec![],
+            errors: Errors::new(),
+        }
+    }
+
     fn shift(&mut self) {
         if let Some(current) = self.current.take() {
             match T::finalize(current) {
@@ -575,7 +595,7 @@ impl<'v, T: FromForm<'v>> VecContext<'v, T> {
     fn context(&mut self, name: &NameView<'v>) -> &mut T::Context {
         let this_key = name.key();
         let keys_match = match (self.last_key, this_key) {
-            (Some(k1), Some(k2)) if k1 == k2 => true,
+            (Some(k1), Some(k2)) => k1 == k2,
             _ => false
         };
 
@@ -594,39 +614,42 @@ impl<'v, T: FromForm<'v> + 'v> FromForm<'v> for Vec<T> {
     type Context = VecContext<'v, T>;
 
     fn init(opts: Options) -> Self::Context {
-        VecContext {
-            opts,
-            last_key: None,
-            current: None,
-            items: vec![],
-            errors: Errors::new(),
-        }
+        VecContext::new(opts)
     }
 
     fn push_value(this: &mut Self::Context, field: ValueField<'v>) {
         T::push_value(this.context(&field.name), field.shift());
     }
 
-    async fn push_data(ctxt: &mut Self::Context, field: DataField<'v, '_>) {
-        T::push_data(ctxt.context(&field.name), field.shift()).await
+    async fn push_data(this: &mut Self::Context, field: DataField<'v, '_>) {
+        T::push_data(this.context(&field.name), field.shift()).await
     }
 
     fn finalize(mut this: Self::Context) -> Result<'v, Self> {
         this.shift();
-        match this.errors.is_empty() {
-            true => Ok(this.items),
-            false => Err(this.errors)?,
+        if !this.errors.is_empty() {
+            Err(this.errors)
+        } else if this.opts.strict && this.items.is_empty() {
+            Err(Errors::from(ErrorKind::Missing))
+        } else {
+            Ok(this.items)
         }
     }
 }
 
+// impl_strict_from_form_field_from_capped!(Vec<u8>);
+
 #[doc(hidden)]
 pub struct MapContext<'v, K, V> where K: FromForm<'v>, V: FromForm<'v> {
     opts: Options,
-    /// Maps from the string key to the index in `map`.
-    key_map: IndexMap<&'v str, (usize, NameView<'v>)>,
-    keys: Vec<K::Context>,
-    values: Vec<V::Context>,
+    /// Maps an index key (&str, map.key=foo, map.k:key) to its entry.
+    /// NOTE: `table`, `entries`, and `metadata` are always the same size.
+    table: IndexMap<&'v str, usize>,
+    /// The `FromForm` context for the (key, value) indexed by `table`.
+    entries: Vec<(K::Context, V::Context)>,
+    /// Recorded metadata for a given key/value pair.
+    metadata: Vec<NameView<'v>>,
+    /// Errors collected while finalizing keys and values.
     errors: Errors<'v>,
 }
 
@@ -636,31 +659,27 @@ impl<'v, K, V> MapContext<'v, K, V>
     fn new(opts: Options) -> Self {
         MapContext {
             opts,
-            key_map: IndexMap::new(),
-            keys: vec![],
-            values: vec![],
+            table: IndexMap::new(),
+            entries: vec![],
+            metadata: vec![],
             errors: Errors::new(),
         }
     }
 
-    fn ctxt(&mut self, key: &'v str, name: NameView<'v>) -> (&mut K::Context, &mut V::Context) {
-        match self.key_map.get(key) {
-            Some(&(i, _)) => (&mut self.keys[i], &mut self.values[i]),
+    fn ctxt(&mut self, key: &'v str, name: NameView<'v>) -> &mut (K::Context, V::Context) {
+        match self.table.get(key) {
+            Some(i) => &mut self.entries[*i],
             None => {
-                debug_assert_eq!(self.keys.len(), self.values.len());
-                let map_index = self.keys.len();
-                self.keys.push(K::init(self.opts));
-                self.values.push(V::init(self.opts));
-                self.key_map.insert(key, (map_index, name));
-                (self.keys.last_mut().unwrap(), self.values.last_mut().unwrap())
+                let i = self.entries.len();
+                self.table.insert(key, i);
+                self.entries.push((K::init(self.opts), V::init(self.opts)));
+                self.metadata.push(name);
+                &mut self.entries[i]
             }
         }
     }
 
-    fn push(
-        &mut self,
-        name: NameView<'v>
-    ) -> Option<Either<&mut K::Context, &mut V::Context>> {
+    fn push(&mut self, name: NameView<'v>) -> Option<Either<&mut K::Context, &mut V::Context>> {
         let index_pair = name.key()
             .map(|k| k.indices())
             .map(|mut i| (i.next(), i.next()))
@@ -668,7 +687,7 @@ impl<'v, K, V> MapContext<'v, K, V>
 
         match index_pair {
             (Some(key), None) => {
-                let is_new_key = !self.key_map.contains_key(key);
+                let is_new_key = !self.table.contains_key(key);
                 let (key_ctxt, val_ctxt) = self.ctxt(key, name);
                 if is_new_key {
                     K::push_value(key_ctxt, ValueField::from_value(key));
@@ -678,9 +697,9 @@ impl<'v, K, V> MapContext<'v, K, V>
             },
             (Some(kind), Some(key)) => {
                 if kind.as_uncased().starts_with("k") {
-                    return Some(Either::Left(self.ctxt(key, name).0));
+                    return Some(Either::Left(&mut self.ctxt(key, name).0));
                 } else if kind.as_uncased().starts_with("v") {
-                    return Some(Either::Right(self.ctxt(key, name).1));
+                    return Some(Either::Right(&mut self.ctxt(key, name).1));
                 } else {
                     let error = Error::from(&[Cow::Borrowed("k"), Cow::Borrowed("v")])
                         .with_entity(Entity::Index(0))
@@ -717,29 +736,34 @@ impl<'v, K, V> MapContext<'v, K, V>
         }
     }
 
-    fn finalize<T: std::iter::FromIterator<(K, V)>>(self) -> Result<'v, T> {
-        let (keys, values, key_map) = (self.keys, self.values, self.key_map);
-        let errors = std::cell::RefCell::new(self.errors);
+    fn finalize<T: std::iter::FromIterator<(K, V)>>(mut self) -> Result<'v, T> {
+        let map: T = self.entries.into_iter()
+            .zip(self.metadata.iter())
+            .zip(self.table.keys())
+            .filter_map(|(((k_ctxt, v_ctxt), name), idx)| {
+                let key = K::finalize(k_ctxt)
+                    .map_err(|e| {
+                        // FIXME: Fix `NameBuf` to take in `k` and add it.
+                        // FIXME: Perhaps the `k` should come after: `map.0:k`.
+                        let form_key = format!("k:{}", idx);
+                        self.errors.extend(e.with_name((name.parent(), form_key)));
+                    })
+                    .ok();
 
-        let keys = keys.into_iter()
-            .zip(key_map.values().map(|(_, name)| name))
-            .filter_map(|(ctxt, name)| match K::finalize(ctxt) {
-                Ok(value) => Some(value),
-                Err(e) => { errors.borrow_mut().extend(e.with_name(*name)); None },
-            });
+                let val = V::finalize(v_ctxt)
+                    .map_err(|e| self.errors.extend(e.with_name((name.parent(), *idx))))
+                    .ok();
 
-        let values = values.into_iter()
-            .zip(key_map.values().map(|(_, name)| name))
-            .filter_map(|(ctxt, name)| match V::finalize(ctxt) {
-                Ok(value) => Some(value),
-                Err(e) => { errors.borrow_mut().extend(e.with_name(*name)); None },
-            });
+                Some((key?, val?))
+            })
+            .collect();
 
-        let map: T = keys.zip(values).collect();
-        let no_errors = errors.borrow().is_empty();
-        match no_errors {
-            true => Ok(map),
-            false => Err(errors.into_inner())
+        if !self.errors.is_empty() {
+            Err(self.errors)
+        } else if self.opts.strict && self.table.is_empty() {
+            Err(Errors::from(ErrorKind::Missing))
+        } else {
+            Ok(map)
         }
     }
 }
@@ -794,8 +818,8 @@ impl<'v, K, V> FromForm<'v> for BTreeMap<K, V>
 impl<'v, T: FromForm<'v>> FromForm<'v> for Option<T> {
     type Context = <T as FromForm<'v>>::Context;
 
-    fn init(opts: Options) -> Self::Context {
-        T::init(Options { strict: true, ..opts })
+    fn init(_: Options) -> Self::Context {
+        T::init(Options { strict: true })
     }
 
     fn push_value(ctxt: &mut Self::Context, field: ValueField<'v>) {
@@ -894,3 +918,72 @@ impl<'v, A: FromForm<'v>, B: FromForm<'v>> FromForm<'v> for (A, B) {
         }
     }
 }
+
+#[crate::async_trait]
+impl<'v, T: FromForm<'v> + Sync> FromForm<'v> for Arc<T> {
+    type Context = <T as FromForm<'v>>::Context;
+
+    fn init(opts: Options) -> Self::Context {
+        T::init(opts)
+    }
+
+    fn push_value(ctxt: &mut Self::Context, field: ValueField<'v>) {
+        T::push_value(ctxt, field)
+    }
+
+    async fn push_data(ctxt: &mut Self::Context, field: DataField<'v, '_>) {
+        T::push_data(ctxt, field).await
+    }
+
+    fn finalize(this: Self::Context) -> Result<'v, Self> {
+        T::finalize(this).map(Arc::new)
+    }
+}
+
+macro_rules! impl_via_proxy {
+    ($R:ident => struct $T:ident <$($G:ident),*> { $($f:ident : $F:ident),* }) => {
+        const _: () = {
+            use super::*;
+
+            mod proxy {
+                #[derive(rocket::FromForm)]
+                pub struct $T<$($G),*> {
+                    $(pub $f : $F),*
+                }
+            }
+
+            #[crate::async_trait]
+            impl<'v, $($G: Send),*> FromForm<'v> for $R<$($G),*>
+                where proxy::$T<$($G),*>: FromForm<'v>
+            {
+                type Context = <proxy::$T<$($G),*> as FromForm<'v>>::Context;
+
+                fn init(opts: Options) -> Self::Context {
+                    <proxy::$T<$($G),*>>::init(opts)
+                }
+
+                fn push_value(ctxt: &mut Self::Context, field: ValueField<'v>) {
+                    <proxy::$T<$($G),*>>::push_value(ctxt, field)
+                }
+
+                async fn push_data(ctxt: &mut Self::Context, field: DataField<'v, '_>) {
+                    <proxy::$T<$($G),*>>::push_data(ctxt, field).await
+                }
+
+                fn finalize(this: Self::Context) -> Result<'v, Self> {
+                    let proxy = <proxy::$T<$($G),*>>::finalize(this)?;
+                    Ok($R {
+                        $($f : proxy.$f),*
+                    })
+                }
+            }
+        };
+    }
+}
+
+use std::ops::{Range, RangeFrom, RangeTo, RangeToInclusive};
+
+impl_via_proxy!(Range => struct Range<T> { start: T, end: T });
+impl_via_proxy!(RangeFrom => struct RangeFrom<T> { start: T });
+impl_via_proxy!(RangeTo => struct RangeTo<T> { end: T });
+impl_via_proxy!(RangeToInclusive => struct RangeToInclusive<T> { end: T });

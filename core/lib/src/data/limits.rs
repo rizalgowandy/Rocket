@@ -1,5 +1,3 @@
-use std::fmt;
-
 use serde::{Serialize, Deserialize};
 use crate::request::{Request, FromRequest, Outcome};
 
@@ -59,8 +57,10 @@ use crate::http::uncased::Uncased;
 /// | `data-form`       | 2MiB    | [`Form`]     | entire data-based form                |
 /// | `file`            | 1MiB    | [`TempFile`] | [`TempFile`] data guard or form field |
 /// | `file/$ext`       | _N/A_   | [`TempFile`] | file form field with extension `$ext` |
-/// | `string`          | 8KiB    | [`String`]   | data guard or data form field         |
+/// | `string`          | 8KiB    | [`String`]   | data guard or form field              |
+/// | `string`          | 8KiB    | [`&str`]     | data guard or form field              |
 /// | `bytes`           | 8KiB    | [`Vec<u8>`]  | data guard                            |
+/// | `bytes`           | 8KiB    | [`&[u8]`]    | data guard or form field              |
 /// | `json`            | 1MiB    | [`Json`]     | JSON data and form payloads           |
 /// | `msgpack`         | 1MiB    | [`MsgPack`]  | MessagePack data and form payloads    |
 ///
@@ -122,8 +122,9 @@ use crate::http::uncased::Uncased;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Limits {
-    #[serde(with = "figment::util::vec_tuple_map")]
-    limits: Vec<(Uncased<'static>, ByteUnit)>
+    #[serde(deserialize_with = "Limits::deserialize")]
+    #[serde(serialize_with = "figment::util::vec_tuple_map::serialize")]
+    pub(crate) limits: Vec<(Uncased<'static>, ByteUnit)>,
 }
 
 impl Default for Limits {
@@ -299,16 +300,15 @@ impl Limits {
 
         None
     }
-}
 
-impl fmt::Display for Limits {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, (k, v)) in self.limits.iter().enumerate() {
-            if i != 0 { f.write_str(", ")? }
-            write!(f, "{} = {}", k, v)?;
-        }
-
-        Ok(())
+    /// Deserialize a `Limits` vector from a map. Ensures that the resulting
+    /// vector is properly sorted for futures lookups via binary search.
+    fn deserialize<'de, D>(de: D) -> Result<Vec<(Uncased<'static>, ByteUnit)>, D::Error>
+        where D: serde::Deserializer<'de>
+    {
+        let mut limits = figment::util::vec_tuple_map::deserialize(de)?;
+        limits.sort();
+        Ok(limits)
     }
 }
 

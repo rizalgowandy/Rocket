@@ -1,13 +1,9 @@
-// Temporarily allow `IntoIter::into_iter()` before Rust 2021 transition.
-#![allow(deprecated)]
-
-use std::array;
 use std::borrow::Cow;
 
 use tokio::io::AsyncRead;
-use tokio::time::Duration;
-use futures::stream::{self, Stream, StreamExt};
-use futures::future::ready;
+use tokio::time::{interval, Duration};
+use futures::{stream::{self, Stream}, future::Either};
+use tokio_stream::{StreamExt, wrappers::IntervalStream};
 
 use crate::request::Request;
 use crate::response::{self, Response, Responder, stream::{ReaderStream, RawLinedEvent}};
@@ -58,7 +54,7 @@ use crate::http::ContentType;
 /// appears only in the raw server-sent event data stream and is inaccessible by
 /// most clients. This includes JavaScript's `EventSource`. As such, they serve
 /// little utility beyond debugging a raw data stream and keeping a connection
-/// alive. See [hearbeat](struct@EventStream#heartbeat) for information on
+/// alive. See [heartbeat](struct@EventStream#heartbeat) for information on
 /// Rocket's `EventStream` keep-alive.
 ///
 /// # Fields
@@ -283,7 +279,7 @@ impl Event {
     ///
     /// // The two below are equivalent.
     /// let event = Event::comment("bye").with_data("goodbye");
-    /// let event = Event::data("goodbyte").with_comment("bye");
+    /// let event = Event::data("goodbye").with_comment("bye");
     /// ```
     pub fn with_data<T: Into<Cow<'static, str>>>(mut self, data: T) -> Self {
         self.data = Some(data.into());
@@ -302,7 +298,7 @@ impl Event {
     ///
     /// // The two below are equivalent.
     /// let event = Event::comment("bye").with_data("goodbye");
-    /// let event = Event::data("goodbyte").with_comment("bye");
+    /// let event = Event::data("goodbye").with_comment("bye");
     /// ```
     pub fn with_comment<T: Into<Cow<'static, str>>>(mut self, data: T) -> Self {
         self.comment = Some(data.into());
@@ -340,7 +336,7 @@ impl Event {
             Some(RawLinedEvent::raw("")),
         ];
 
-        stream::iter(array::IntoIter::new(events)).filter_map(ready)
+        stream::iter(events).filter_map(|x| x)
     }
 }
 
@@ -355,9 +351,9 @@ impl Event {
 /// # Responder
 ///
 /// `EventStream` is a (potentially infinite) responder. The response
-/// `Content-Type` is set to [`EventStream`](ContentType::EventStream). The body
-/// is [unsized](crate::response::Body#unsized), and values are sent as soon as
-/// they are yielded by the internal iterator.
+/// `Content-Type` is set to [`EventStream`](const@ContentType::EventStream).
+/// The body is [unsized](crate::response::Body#unsized), and values are sent as
+/// soon as they are yielded by the internal iterator.
 ///
 /// ## Heartbeat
 ///
@@ -374,7 +370,7 @@ impl Event {
 ///
 /// ```rust
 /// # use rocket::*;
-/// use rocket::response::stream::{Event, EventStream};;
+/// use rocket::response::stream::{Event, EventStream};
 /// use rocket::tokio::time::{self, Duration};
 ///
 /// #[get("/events")]
@@ -479,6 +475,16 @@ impl Event {
 ///
 ///    To send messages losslessly, they must be encoded first, for instance, by
 ///    using [`Event::json()`].
+///
+///  * **Clients reconnect ad-infinitum**
+///
+///    The [SSE standard] stipulates: _"Clients will reconnect if the connection
+///    is closed; a client can be told to stop reconnecting using the HTTP 204
+///    No Content response code."_ As a result, clients will typically reconnect
+///    exhaustively until either they choose to disconnect or they receive a
+///    `204 No Content` response.
+///
+///    [SSE standard]: https://html.spec.whatwg.org/multipage/server-sent-events.html
 pub struct EventStream<S> {
     stream: S,
     heartbeat: Option<Duration>,
@@ -522,25 +528,19 @@ impl<S: Stream<Item = Event>> EventStream<S> {
         self
     }
 
-    fn heartbeat_stream(&self) -> Option<impl Stream<Item = RawLinedEvent>> {
-        use tokio::time::interval;
-        use tokio_stream::wrappers::IntervalStream;
-
+    fn heartbeat_stream(&self) -> impl Stream<Item = RawLinedEvent> {
         self.heartbeat
             .map(|beat| IntervalStream::new(interval(beat)))
-            .map(|stream| stream.map(|_| RawLinedEvent::raw(":\n")))
+            .map(|stream| stream.map(|_| RawLinedEvent::raw(":")))
+            .map_or_else(|| Either::Right(stream::empty()), Either::Left)
     }
 
     fn into_stream(self) -> impl Stream<Item = RawLinedEvent> {
-        use futures::future::Either;
-        use crate::ext::StreamExt;
+        use futures::StreamExt;
 
-        let heartbeat_stream = self.heartbeat_stream();
-        let raw_events = self.stream.map(|e| e.into_stream()).flatten();
-        match heartbeat_stream {
-            Some(heartbeat) => Either::Left(raw_events.join(heartbeat)),
-            None => Either::Right(raw_events)
-        }
+        let heartbeats = self.heartbeat_stream();
+        let events = StreamExt::map(self.stream, |e| e.into_stream()).flatten();
+        crate::util::join(events, heartbeats)
     }
 
     fn into_reader(self) -> impl AsyncRead {
@@ -615,10 +615,11 @@ mod sse_tests {
 
     impl<S: Stream<Item = Event>> EventStream<S> {
         fn into_string(self) -> String {
+            use std::pin::pin;
+
             crate::async_test(async move {
                 let mut string = String::new();
-                let reader = self.into_reader();
-                tokio::pin!(reader);
+                let mut reader = pin!(self.into_reader());
                 reader.read_to_string(&mut string).await.expect("event stream -> string");
                 string
             })
@@ -766,7 +767,7 @@ mod sse_tests {
         use futures::future::ready;
         use futures::stream::{once, iter, StreamExt};
 
-        const HEARTBEAT: &str = ":\n\n";
+        const HEARTBEAT: &str = ":\n";
 
         // Set a heartbeat interval of 250ms. Send nothing for 600ms. We should
         // get 2 or 3 heartbeats, the latter if one is sent eagerly. Maybe 4.
@@ -781,29 +782,30 @@ mod sse_tests {
         assert!(heartbeats >= 2 && heartbeats <= 4, "got {} beat(s)", heartbeats);
 
         let stream = EventStream! {
-            time::sleep(Duration::from_millis(200)).await;
+            time::sleep(Duration::from_millis(250)).await;
             yield Event::data("foo");
-            time::sleep(Duration::from_millis(200)).await;
+            time::sleep(Duration::from_millis(250)).await;
             yield Event::data("bar");
         };
 
-        let string = stream.heartbeat(Duration::from_millis(300)).into_string();
+        // We expect: foo\n\n [heartbeat] bar\n\n [maybe heartbeat].
+        let string = stream.heartbeat(Duration::from_millis(350)).into_string();
         let heartbeats = string.matches(HEARTBEAT).count();
         assert!(heartbeats >= 1 && heartbeats <= 3, "got {} beat(s)", heartbeats);
-        assert!(string.contains("data:foo\n\n"));
-        assert!(string.contains("data:bar\n\n"));
+        assert!(string.contains("data:foo\n\n"), "string = {:?}", string);
+        assert!(string.contains("data:bar\n\n"), "string = {:?}", string);
 
         // We shouldn't send a heartbeat if a message is immediately available.
         let stream = EventStream::from(once(ready(Event::data("hello"))));
         let string = stream.heartbeat(Duration::from_secs(1)).into_string();
-        assert_eq!(string, "data:hello\n\n");
+        assert_eq!(string, "data:hello\n\n", "string = {:?}", string);
 
         // It's okay if we do it with two, though.
         let stream = EventStream::from(iter(vec![Event::data("a"), Event::data("b")]));
         let string = stream.heartbeat(Duration::from_secs(1)).into_string();
         let heartbeats = string.matches(HEARTBEAT).count();
         assert!(heartbeats <= 1);
-        assert!(string.contains("data:a\n\n"));
-        assert!(string.contains("data:b\n\n"));
+        assert!(string.contains("data:a\n\n"), "string = {:?}", string);
+        assert!(string.contains("data:b\n\n"), "string = {:?}", string);
     }
 }

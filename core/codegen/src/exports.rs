@@ -69,9 +69,9 @@ define_exported_paths! {
     _request => ::rocket::request,
     _response => ::rocket::response,
     _route => ::rocket::route,
+    _error => ::rocket::error,
     _catcher => ::rocket::catcher,
     _sentinel => ::rocket::sentinel,
-    _log => ::rocket::log,
     _form => ::rocket::form::prelude,
     _http => ::rocket::http,
     _uri => ::rocket::http::uri,
@@ -85,6 +85,8 @@ define_exported_paths! {
     _Box => ::std::boxed::Box,
     _Vec => ::std::vec::Vec,
     _Cow => ::std::borrow::Cow,
+    _ExitCode => ::std::process::ExitCode,
+    display_hack => ::rocket::error::display_hack,
     BorrowMut => ::std::borrow::BorrowMut,
     Outcome => ::rocket::outcome::Outcome,
     FromForm => ::rocket::form::FromForm,
@@ -99,10 +101,15 @@ define_exported_paths! {
     StaticCatcherInfo => ::rocket::StaticCatcherInfo,
     Route => ::rocket::Route,
     Catcher => ::rocket::Catcher,
-    SmallVec => ::rocket::http::private::SmallVec,
     Status => ::rocket::http::Status,
 }
 
 macro_rules! define_spanned_export {
     ($span:expr => $($name:ident),*) => ($(define!($span => $name $name);)*)
+}
+
+/// Convenience: returns a "mixed site" span located at `span`.
+#[inline(always)]
+pub fn mixed(span: Span) -> Span {
+    Span::mixed_site().located_at(span)
 }

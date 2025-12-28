@@ -1,6 +1,6 @@
 //! Automatic JSON (de)serialization support.
 //!
-//! See [`Json`](Json) for details.
+//! See [`Json`] for details.
 //!
 //! # Enabling
 //!
@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dependencies.rocket]
-//! version = "0.5.0-rc.1"
+//! version = "0.6.0-dev"
 //! features = ["json"]
 //! ```
 //!
@@ -201,12 +201,12 @@ impl<'r, T: Deserialize<'r>> FromData<'r> for Json<T> {
         match Self::from_data(req, data).await {
             Ok(value) => Outcome::Success(value),
             Err(Error::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                Outcome::Failure((Status::PayloadTooLarge, Error::Io(e)))
+                Outcome::Error((Status::PayloadTooLarge, Error::Io(e)))
             },
             Err(Error::Parse(s, e)) if e.classify() == serde_json::error::Category::Data => {
-                Outcome::Failure((Status::UnprocessableEntity, Error::Parse(s, e)))
+                Outcome::Error((Status::UnprocessableEntity, Error::Parse(s, e)))
             },
-            Err(e) => Outcome::Failure((Status::BadRequest, e)),
+            Err(e) => Outcome::Error((Status::BadRequest, e)),
 
         }
     }
@@ -219,7 +219,7 @@ impl<'r, T: Serialize> Responder<'r, 'static> for Json<T> {
     fn respond_to(self, req: &'r Request<'_>) -> response::Result<'static> {
         let string = serde_json::to_string(&self.0)
             .map_err(|e| {
-                error_!("JSON failed to serialize: {:?}", e);
+                error!("JSON serialize failure: {}", e);
                 Status::InternalServerError
             })?;
 

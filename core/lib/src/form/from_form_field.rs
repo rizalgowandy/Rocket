@@ -28,11 +28,32 @@ use crate::form::prelude::*;
 /// }
 /// ```
 ///
+/// # Semantics
+///
+/// The implementation of `FromForm` for a `T: FromFormField` type operates as
+/// follows:
+///
+///   * When parsing is **strict**, the parser accepts the _first_ value or data
+///     field with the corresponding field name and calls `T::from_value()` or
+///     `T::from_data()` with the field's value, respectively. If more than one
+///     field value is seen, an [`ErrorKind::Duplicate`) is emitted. If no
+///     matching field is seen, an [`ErrorKind::Missing`] is emitted. Otherwise,
+///     the result from the call is emitted.
+///
+///   * When parsing is **lenient**, the parser accepts the first _expected_
+///     value or data field with the corresponding field name and calls
+///     `T::from_value()` or `T::from_data()` with the field's value,
+///     respectively. Unexpected values, identified by returning an
+///     [`ErrorKind::Unexpected`] from `from_value()` or `from_data()` are
+///     ignored. Any additional fields with a matching field name are ignored.
+///     If no matching field is seen and `T` has a default, it is used,
+///     otherwise an [`ErrorKind::Missing`] is emitted.
+///
 /// # Deriving
 ///
 /// `FromFormField` can be derived for C-like enums, where the generated
 /// implementation case-insensitively parses fields with values equal to the
-/// name of the variant or the value in `field(value = "...")`.
+/// name of the variant or the value in `field()`.
 ///
 /// ```rust
 /// # use rocket::form::FromFormField;
@@ -276,7 +297,7 @@ impl<'v> FromFormField<'v> for Capped<&'v str> {
 
         match <Capped<&'v str> as FromData>::from_data(f.request, f.data).await {
             Outcome::Success(p) => Ok(p),
-            Outcome::Failure((_, e)) => Err(e)?,
+            Outcome::Error((_, e)) => Err(e)?,
             Outcome::Forward(..) => {
                 Err(Error::from(ErrorKind::Unexpected).with_entity(Entity::DataField))?
             }
@@ -297,7 +318,7 @@ impl<'v> FromFormField<'v> for Capped<String> {
 
         match <Capped<String> as FromData>::from_data(f.request, f.data).await {
             Outcome::Success(p) => Ok(p),
-            Outcome::Failure((_, e)) => Err(e)?,
+            Outcome::Error((_, e)) => Err(e)?,
             Outcome::Forward(..) => {
                 Err(Error::from(ErrorKind::Unexpected).with_entity(Entity::DataField))?
             }
@@ -321,6 +342,27 @@ impl<'v> FromFormField<'v> for bool {
         }
     }
 }
+
+#[crate::async_trait]
+impl<'v> FromFormField<'v> for Capped<&'v [u8]> {
+    fn from_value(field: ValueField<'v>) -> Result<'v, Self> {
+        Ok(Capped::from(field.value.as_bytes()))
+    }
+
+    async fn from_data(f: DataField<'v, '_>) -> Result<'v, Self> {
+        use crate::data::{Capped, Outcome, FromData};
+
+        match <Capped<&'v [u8]> as FromData>::from_data(f.request, f.data).await {
+            Outcome::Success(p) => Ok(p),
+            Outcome::Error((_, e)) => Err(e)?,
+            Outcome::Forward(..) => {
+                Err(Error::from(ErrorKind::Unexpected).with_entity(Entity::DataField))?
+            }
+        }
+    }
+}
+
+impl_strict_from_form_field_from_capped!(&'v [u8]);
 
 #[crate::async_trait]
 impl<'v> FromFormField<'v> for Capped<Cow<'v, str>> {
@@ -349,6 +391,7 @@ macro_rules! impl_with_parse {
 }
 
 impl_with_parse!(
+    char,
     f32, f64,
     isize, i8, i16, i32, i64, i128,
     usize, u8, u16, u32, u64, u128,
@@ -356,7 +399,7 @@ impl_with_parse!(
     NonZeroUsize, NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU128,
     Ipv4Addr, IpAddr, Ipv6Addr, SocketAddrV4, SocketAddrV6, SocketAddr
 );
-//
+
 // Keep formats in sync with 'FromFormField' impls.
 static DATE_FMT: &[FormatItem<'_>] = format_description!("[year padding:none]-[month]-[day]");
 static TIME_FMT1: &[FormatItem<'_>] = format_description!("[hour padding:none]:[minute]:[second]");

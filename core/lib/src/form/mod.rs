@@ -1,6 +1,6 @@
 //! Parsing and validation of HTTP forms and fields.
 //!
-//! See the [forms guide](https://rocket.rs/v0.5-rc/guide/requests#forms) for
+//! See the [forms guide](https://rocket.rs/master/guide/requests#forms) for
 //! general form support documentation.
 //!
 //! # Field Wire Format
@@ -45,7 +45,8 @@
 //!   * `map[k:1]=Bob`
 //!   * `people[bob]nickname=Stan`
 //!
-//! See [`FromForm`] for full details on push-parsing and complete examples.
+//! See [`FromForm`] for full details on push-parsing and complete examples, and
+//! [`Form`] for how to accept forms in a request handler.
 
 // ## Maps w/named Fields (`struct`)
 //
@@ -113,7 +114,7 @@
 //             .map_err(|e| errors.push(e))
 //             .map(Some).unwrap_or(None);
 //
-//          let field_b = B::finblize(&mut this.field_b)
+//          let field_b = B::finalize(&mut this.field_b)
 //             .map_err(|e| errors.push(e))
 //             .map(Some).unwrap_or(None);
 //
@@ -340,6 +341,7 @@
 //      `key_contexts: Vec<K::Context>`, a vector of `value_contexts:
 //      Vec<V::Context>`, a `mapping` from a string index to an integer index
 //      into the `contexts`, and a vector of `errors`.
+//
 //   2. **Push.** An index is required; an error is emitted and `push` returns
 //      if they field's first key does not contain an index. If the first key
 //      contains _one_ index, a new `K::Context` and `V::Context` are created.
@@ -355,9 +357,9 @@
 //      to `second` in `mapping`. If the first index is `k`, the field,
 //      stripped of the first key, is pushed to the key's context; the same is
 //      done for the value's context is the first index is `v`.
+//
 //   3. **Finalization.** Every context is finalized; errors and `Ok` values
-//      are collected. TODO: FINISH. Split this into two: one for single-index,
-//      another for two-indices.
+//      are collected.
 
 mod field;
 mod options;
@@ -368,6 +370,7 @@ mod context;
 mod strict;
 mod lenient;
 mod parser;
+mod buffer;
 pub mod validate;
 pub mod name;
 pub mod error;
@@ -383,6 +386,9 @@ pub use rocket_codegen::{FromForm, FromFormField};
 
 #[doc(inline)]
 pub use self::error::{Errors, Error};
+
+#[doc(hidden)]
+pub use self::buffer::{SharedStack, Shareable};
 
 pub use field::*;
 pub use options::*;

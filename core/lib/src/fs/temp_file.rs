@@ -8,8 +8,9 @@ use crate::form::{FromFormField, ValueField, DataField, error::Errors};
 use crate::outcome::IntoOutcome;
 use crate::fs::FileName;
 
+use tokio::task;
 use tokio::fs::{self, File};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufRead, BufReader};
 use tempfile::{NamedTempFile, TempPath};
 use either::Either;
 
@@ -32,7 +33,7 @@ use either::Either;
 /// 1. A `TempFile` is created at random path `foo`.
 /// 2. The system cleaner removes the file at path `foo`.
 /// 3. Another application creates a file at path `foo`.
-/// 4. The `TempFile`, ostesnsibly at path, `foo`, is persisted unexpectedly
+/// 4. The `TempFile`, ostensibly at path `foo`, is persisted unexpectedly
 ///    with contents different from those in step 1.
 ///
 /// To safe-guard against this issue, you should ensure that your temporary file
@@ -109,7 +110,7 @@ pub enum TempFile<'v> {
     },
     #[doc(hidden)]
     Buffered {
-        content: &'v str,
+        content: &'v [u8],
     }
 }
 
@@ -127,7 +128,7 @@ impl<'v> TempFile<'v> {
     ///
     /// # Cross-Device Persistence
     ///
-    /// Attemping to persist a temporary file across logical devices (or mount
+    /// Attempting to persist a temporary file across logical devices (or mount
     /// points) will result in an error. This is a limitation of the underlying
     /// OS. Your options are thus:
     ///
@@ -159,7 +160,7 @@ impl<'v> TempFile<'v> {
     ///
     ///     Ok(())
     /// }
-    /// # let file = TempFile::Buffered { content: "hi".into() };
+    /// # let file = TempFile::Buffered { content: "hi".as_bytes() };
     /// # rocket::async_test(handle(file)).unwrap();
     /// ```
     pub async fn persist_to<P>(&mut self, path: P) -> io::Result<()>
@@ -171,8 +172,7 @@ impl<'v> TempFile<'v> {
                 let path = mem::replace(either, Either::Right(new_path.clone()));
                 match path {
                     Either::Left(temp) => {
-                        let result = tokio::task::spawn_blocking(move || temp.persist(new_path))
-                            .await
+                        let result = task::spawn_blocking(move || temp.persist(new_path)).await
                             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "spawn_block"))?;
 
                         if let Err(e) = result {
@@ -189,8 +189,7 @@ impl<'v> TempFile<'v> {
                 }
             }
             TempFile::Buffered { content } => {
-                let mut file = File::create(&new_path).await?;
-                file.write_all(content.as_bytes()).await?;
+                fs::write(&new_path, &content).await?;
                 *self = TempFile::File {
                     file_name: None,
                     content_type: None,
@@ -228,10 +227,12 @@ impl<'v> TempFile<'v> {
     ///     # let some_other_path = std::env::temp_dir().join("some-other.txt");
     ///     file.copy_to(&some_other_path).await?;
     ///     assert_eq!(file.path(), Some(&*some_path));
+    ///     # assert_eq!(std::fs::read(some_path).unwrap(), b"hi");
+    ///     # assert_eq!(std::fs::read(some_other_path).unwrap(), b"hi");
     ///
     ///     Ok(())
     /// }
-    /// # let file = TempFile::Buffered { content: "hi".into() };
+    /// # let file = TempFile::Buffered { content: b"hi" };
     /// # rocket::async_test(handle(file)).unwrap();
     /// ```
     pub async fn copy_to<P>(&mut self, path: P) -> io::Result<()>
@@ -242,8 +243,7 @@ impl<'v> TempFile<'v> {
                 let old_path = mem::replace(either, Either::Right(either.to_path_buf()));
                 match old_path {
                     Either::Left(temp) => {
-                        let result = tokio::task::spawn_blocking(move || temp.keep())
-                            .await
+                        let result = task::spawn_blocking(move || temp.keep()).await
                             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "spawn_block"))?;
 
                         if let Err(e) = result {
@@ -258,8 +258,7 @@ impl<'v> TempFile<'v> {
             }
             TempFile::Buffered { content } => {
                 let path = path.as_ref();
-                let mut file = File::create(path).await?;
-                file.write_all(content.as_bytes()).await?;
+                fs::write(&path, &content).await?;
                 *self = TempFile::File {
                     file_name: None,
                     content_type: None,
@@ -297,7 +296,7 @@ impl<'v> TempFile<'v> {
     ///
     ///     Ok(())
     /// }
-    /// # let file = TempFile::Buffered { content: "hi".into() };
+    /// # let file = TempFile::Buffered { content: "hi".as_bytes() };
     /// # rocket::async_test(handle(file)).unwrap();
     /// ```
     pub async fn move_copy_to<P>(&mut self, path: P) -> io::Result<()>
@@ -312,6 +311,70 @@ impl<'v> TempFile<'v> {
         }
 
         Ok(())
+    }
+
+    /// Open the file for reading, returning an `async` stream of the file.
+    ///
+    /// This method should be used sparingly. `TempFile` is intended to be used
+    /// when the incoming data is destined to be stored on disk. If the incoming
+    /// data is intended to be streamed elsewhere, prefer to implement a custom
+    /// form guard via [`FromFormField`] that directly streams the incoming data
+    /// to the ultimate destination.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[macro_use] extern crate rocket;
+    /// use rocket::fs::TempFile;
+    /// use rocket::tokio::io;
+    ///
+    /// #[post("/", data = "<file>")]
+    /// async fn handle(file: TempFile<'_>) -> std::io::Result<()> {
+    ///     let mut stream = file.open().await?;
+    ///     io::copy(&mut stream, &mut io::stdout()).await?;
+    ///     Ok(())
+    /// }
+    /// # let file = TempFile::Buffered { content: "hi".as_bytes() };
+    /// # rocket::async_test(handle(file)).unwrap();
+    /// ```
+    pub async fn open(&self) -> io::Result<impl AsyncBufRead + '_> {
+        use tokio_util::either::Either;
+
+        match self {
+            TempFile::File { path, .. } => {
+                let path = match path {
+                    either::Either::Left(p) => p.as_ref(),
+                    either::Either::Right(p) => p.as_path(),
+                };
+
+                let reader = BufReader::new(File::open(path).await?);
+                Ok(Either::Left(reader))
+            },
+            TempFile::Buffered { content } => {
+                Ok(Either::Right(*content))
+            },
+        }
+    }
+
+    /// Returns whether the file is empty.
+    ///
+    /// This is equivalent to `file.len() == 0`.
+    ///
+    /// This method does not perform any system calls.
+    ///
+    /// ```rust
+    /// # #[macro_use] extern crate rocket;
+    /// use rocket::fs::TempFile;
+    ///
+    /// #[post("/", data = "<file>")]
+    /// fn handler(file: TempFile<'_>) {
+    ///     if file.is_empty() {
+    ///         assert_eq!(file.len(), 0);
+    ///     }
+    /// }
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Returns the size, in bytes, of the file.
@@ -351,10 +414,11 @@ impl<'v> TempFile<'v> {
     ///     # let some_path = std::env::temp_dir().join("some-path.txt");
     ///     file.persist_to(&some_path).await?;
     ///     assert_eq!(file.path(), Some(&*some_path));
+    ///     # assert_eq!(std::fs::read(some_path).unwrap(), b"hi");
     ///
     ///     Ok(())
     /// }
-    /// # let file = TempFile::Buffered { content: "hi".into() };
+    /// # let file = TempFile::Buffered { content: b"hi" };
     /// # rocket::async_test(handle(file)).unwrap();
     /// ```
     pub fn path(&self) -> Option<&Path> {
@@ -447,20 +511,20 @@ impl<'v> TempFile<'v> {
     ) -> io::Result<Capped<TempFile<'a>>> {
         let limit = content_type.as_ref()
             .and_then(|ct| ct.extension())
-            .and_then(|ext| req.limits().find(&["file", ext.as_str()]))
+            .and_then(|ext| req.limits().find(["file", ext.as_str()]))
             .or_else(|| req.limits().get("file"))
             .unwrap_or(Limits::FILE);
 
         let temp_dir = req.rocket().config().temp_dir.relative();
-        let file = tokio::task::spawn_blocking(move || {
-            NamedTempFile::new_in(temp_dir)
-        }).await.map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "spawn_block panic")
-        })??;
-
+        let file = task::spawn_blocking(move || NamedTempFile::new_in(temp_dir));
+        let file = file.await;
+        let file = file.map_err(|_| io::Error::new(io::ErrorKind::Other, "spawn_block panic"))??;
         let (file, temp_path) = file.into_parts();
+
         let mut file = File::from_std(file);
-        let n = data.open(limit).stream_to(tokio::io::BufWriter::new(&mut file)).await?;
+        let fut = data.open(limit).stream_to(tokio::io::BufWriter::new(&mut file));
+        let n = fut.await;
+        let n = n?;
         let temp_file = TempFile::File {
             content_type, file_name,
             path: Either::Left(temp_path),
@@ -475,7 +539,7 @@ impl<'v> TempFile<'v> {
 impl<'v> FromFormField<'v> for Capped<TempFile<'v>> {
     fn from_value(field: ValueField<'v>) -> Result<Self, Errors<'v>> {
         let n = N { written: field.value.len() as u64, complete: true  };
-        Ok(Capped::new(TempFile::Buffered { content: field.value }, n))
+        Ok(Capped::new(TempFile::Buffered { content: field.value.as_bytes() }, n))
     }
 
     async fn from_data(
@@ -490,18 +554,17 @@ impl<'r> FromData<'r> for Capped<TempFile<'_>> {
     type Error = io::Error;
 
     async fn from_data(req: &'r Request<'_>, data: Data<'r>) -> data::Outcome<'r, Self> {
-        use yansi::Paint;
-
         let has_form = |ty: &ContentType| ty.is_form_data() || ty.is_form();
         if req.content_type().map_or(false, has_form) {
-            let (tf, form) = (Paint::white("TempFile<'_>"), Paint::white("Form<TempFile<'_>>"));
-            warn_!("Request contains a form that will not be processed.");
-            info_!("Bare `{}` data guard writes raw, unprocessed streams to disk.", tf);
-            info_!("Did you mean to use `{}` instead?", form);
+            warn!(request.content_type = req.content_type().map(display),
+                "Request contains a form that is not being processed.\n\
+                Bare `TempFile` data guard writes raw, unprocessed streams to disk\n\
+                Perhaps you meant to use `Form<TempFile<'_>>` instead?");
         }
 
-        TempFile::from(req, data, None, req.content_type().cloned()).await
-            .into_outcome(Status::BadRequest)
+        TempFile::from(req, data, None, req.content_type().cloned())
+            .await
+            .or_error(Status::BadRequest)
     }
 }
 

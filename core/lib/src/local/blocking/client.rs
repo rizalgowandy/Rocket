@@ -1,8 +1,7 @@
 use std::fmt;
 use std::cell::RefCell;
-use std::convert::TryInto;
 
-use crate::{Rocket, Phase, Orbit, Error};
+use crate::{Rocket, Phase, Orbit, Ignite, Error};
 use crate::local::{asynchronous, blocking::{LocalRequest, LocalResponse}};
 use crate::http::{Method, uri::Origin};
 
@@ -31,7 +30,7 @@ pub struct Client {
 }
 
 impl Client {
-    fn _new<P: Phase>(rocket: Rocket<P>, tracked: bool) -> Result<Client, Error> {
+    fn _new<P: Phase>(rocket: Rocket<P>, tracked: bool, secure: bool) -> Result<Client, Error> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .thread_name("rocket-local-client-worker-thread")
             .worker_threads(1)
@@ -40,7 +39,7 @@ impl Client {
             .expect("create tokio runtime");
 
         // Initialize the Rocket instance
-        let inner = Some(runtime.block_on(asynchronous::Client::_new(rocket, tracked))?);
+        let inner = Some(runtime.block_on(asynchronous::Client::_new(rocket, tracked, secure))?);
         Ok(Self { inner, runtime: RefCell::new(runtime) })
     }
 
@@ -74,9 +73,18 @@ impl Client {
 
     #[inline(always)]
     pub(crate) fn _with_raw_cookies<F, T>(&self, f: F) -> T
-        where F: FnOnce(&crate::http::private::cookie::CookieJar) -> T
+        where F: FnOnce(&cookie::CookieJar) -> T
     {
         self.inner()._with_raw_cookies(f)
+    }
+
+    pub(crate) fn _terminate(mut self) -> Rocket<Ignite> {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let runtime = self.runtime.replace(runtime);
+        let inner = self.inner.take().expect("invariant broken: self.inner is Some");
+        let rocket = runtime.block_on(inner._terminate());
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+        rocket
     }
 
     #[inline(always)]
@@ -98,8 +106,9 @@ impl std::fmt::Debug for Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        let client = self.inner.take();
-        self.block_on(async { drop(client) });
+        if let Some(client) = self.inner.take() {
+            self.block_on(async { drop(client) });
+        }
     }
 }
 

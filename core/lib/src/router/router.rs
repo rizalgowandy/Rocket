@@ -1,103 +1,141 @@
+use std::ops::{Deref, DerefMut};
 use std::collections::HashMap;
 
 use crate::request::Request;
 use crate::http::{Method, Status};
-
 use crate::{Route, Catcher};
 use crate::router::Collide;
 
-#[derive(Debug, Default)]
-pub(crate) struct Router {
-    routes: HashMap<Method, Vec<Route>>,
-    catchers: HashMap<Option<u16>, Vec<Catcher>>,
-}
-
 #[derive(Debug)]
-pub struct Collisions {
-    pub routes: Vec<(Route, Route)>,
-    pub catchers: Vec<(Catcher, Catcher)>,
+pub(crate) struct Router<T>(T);
+
+#[derive(Debug, Default)]
+pub struct Pending {
+    pub routes: Vec<Route>,
+    pub catchers: Vec<Catcher>,
 }
 
-impl Router {
+#[derive(Debug, Default)]
+pub struct Finalized {
+    pub routes: Vec<Route>,
+    pub catchers: Vec<Catcher>,
+    route_map: HashMap<Method, Vec<usize>>,
+    catcher_map: HashMap<Option<u16>, Vec<usize>>,
+}
+
+pub type Pair<T> = (T, T);
+
+pub type Collisions = (Vec<Pair<Route>>, Vec<Pair<Catcher>>);
+
+pub type Result<T, E = Collisions> = std::result::Result<T, E>;
+
+impl Router<Pending> {
     pub fn new() -> Self {
-        Self::default()
+        Router(Pending::default())
     }
 
-    pub fn add_route(&mut self, route: Route) {
-        let routes = self.routes.entry(route.method).or_default();
-        routes.push(route);
-        routes.sort_by_key(|r| r.rank);
-    }
+    pub fn finalize(self) -> Result<Router<Finalized>, Collisions> {
+        fn collisions<'a, T>(items: &'a [T]) -> impl Iterator<Item = (T, T)> + 'a
+            where T: Collide + Clone + 'a,
+        {
+            items.iter()
+                .enumerate()
+                .flat_map(move |(i, a)| {
+                    items.iter()
+                        .skip(i + 1)
+                        .filter(move |b| a.collides_with(b))
+                        .map(move |b| (a.clone(), b.clone()))
+                })
+        }
 
-    pub fn add_catcher(&mut self, catcher: Catcher) {
-        let catchers = self.catchers.entry(catcher.code).or_default();
-        catchers.push(catcher);
-        catchers.sort_by(|a, b| b.base.path().segments().len().cmp(&a.base.path().segments().len()))
-    }
+        let route_collisions: Vec<_> = collisions(&self.routes).collect();
+        let catcher_collisions: Vec<_> = collisions(&self.catchers).collect();
 
-    #[inline]
-    pub fn routes(&self) -> impl Iterator<Item = &Route> + Clone {
-        self.routes.values().flat_map(|v| v.iter())
-    }
+        if !route_collisions.is_empty() || !catcher_collisions.is_empty() {
+            return Err((route_collisions, catcher_collisions))
+        }
 
-    #[inline]
-    pub fn catchers(&self) -> impl Iterator<Item = &Catcher> + Clone {
-        self.catchers.values().flat_map(|v| v.iter())
-    }
+        // create the route map
+        let mut route_map: HashMap<Method, Vec<usize>> = HashMap::new();
+        for (i, route) in self.routes.iter().enumerate() {
+            match route.method {
+                Some(method) => route_map.entry(method).or_default().push(i),
+                None => for method in Method::ALL_VARIANTS {
+                    route_map.entry(*method).or_default().push(i);
+                }
+            }
+        }
 
+        // create the catcher map
+        let mut catcher_map: HashMap<Option<u16>, Vec<usize>> = HashMap::new();
+        for (i, catcher) in self.catchers.iter().enumerate() {
+            catcher_map.entry(catcher.code).or_default().push(i);
+        }
+
+        // sort routes by rank
+        for routes in route_map.values_mut() {
+            routes.sort_by_key(|&i| &self.routes[i].rank);
+        }
+
+        // sort catchers by rank
+        for catchers in catcher_map.values_mut() {
+            catchers.sort_by_key(|&i| &self.catchers[i].rank);
+        }
+
+        Ok(Router(Finalized {
+            routes: self.0.routes,
+            catchers: self.0.catchers,
+            route_map, catcher_map
+        }))
+    }
+}
+
+impl Router<Finalized> {
+    #[track_caller]
     pub fn route<'r, 'a: 'r>(
         &'a self,
         req: &'r Request<'r>
     ) -> impl Iterator<Item = &'a Route> + 'r {
-        // Note that routes are presorted by ascending rank on each `add`.
-        self.routes.get(&req.method())
+        // Note that routes are presorted by ascending rank on each `add` and
+        // that all routes with `None` methods have been cloned into all methods.
+        self.route_map.get(&req.method())
             .into_iter()
-            .flat_map(move |routes| routes.iter().filter(move |r| r.matches(req)))
+            .flat_map(move |routes| routes.iter().map(move |&i| &self.routes[i]))
+            .filter(move |r| r.matches(req))
     }
 
     // For many catchers, using aho-corasick or similar should be much faster.
+    #[track_caller]
     pub fn catch<'r>(&self, status: Status, req: &'r Request<'r>) -> Option<&Catcher> {
         // Note that catchers are presorted by descending base length.
-        let explicit = self.catchers.get(&Some(status.code))
-            .and_then(|c| c.iter().find(|c| c.matches(status, req)));
+        let explicit = self.catcher_map.get(&Some(status.code))
+            .map(|catchers| catchers.iter().map(|&i| &self.catchers[i]))
+            .and_then(|mut catchers| catchers.find(|c| c.matches(status, req)));
 
-        let default = self.catchers.get(&None)
-            .and_then(|c| c.iter().find(|c| c.matches(status, req)));
+        let default = self.catcher_map.get(&None)
+            .map(|catchers| catchers.iter().map(|&i| &self.catchers[i]))
+            .and_then(|mut catchers| catchers.find(|c| c.matches(status, req)));
 
         match (explicit, default) {
             (None, None) => None,
             (None, c@Some(_)) | (c@Some(_), None) => c,
-            (Some(a), Some(b)) => {
-                if b.base.path().segments().len() > a.base.path().segments().len() {
-                    Some(b)
-                } else {
-                    Some(a)
-                }
-            }
+            (Some(a), Some(b)) if a.rank <= b.rank => Some(a),
+            (Some(_), Some(b)) => Some(b),
         }
     }
+}
 
-    fn collisions<'a, I, T>(&self, items: I) -> impl Iterator<Item = (T, T)> + 'a
-        where I: Iterator<Item = &'a T> + Clone + 'a, T: Collide + Clone + 'a,
-    {
-        items.clone().enumerate()
-            .flat_map(move |(i, a)| {
-                items.clone()
-                    .skip(i + 1)
-                    .filter(move |b| a.collides_with(b))
-                    .map(move |b| (a.clone(), b.clone()))
-            })
+impl<T> Deref for Router<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
+}
 
-    pub fn finalize(&self) -> Result<(), Collisions> {
-        let routes: Vec<_> = self.collisions(self.routes()).collect();
-        let catchers: Vec<_> = self.collisions(self.catchers()).collect();
-
-        if !routes.is_empty() || !catchers.is_empty() {
-            return Err(Collisions { routes, catchers })
-        }
-
-        Ok(())
+impl DerefMut for Router<Pending> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -107,52 +145,34 @@ mod test {
 
     use crate::route::dummy_handler;
     use crate::local::blocking::Client;
-    use crate::http::{Method, Method::*, uri::Origin};
+    use crate::http::{Method::*, uri::Origin};
 
-    impl Router {
-        fn has_collisions(&self) -> bool {
-            self.finalize().is_err()
-        }
-    }
-
-    fn router_with_routes(routes: &[&'static str]) -> Router {
+    fn make_router<I>(routes: I) -> Result<Router<Finalized>, Collisions>
+        where I: Iterator<Item = (Option<isize>, &'static str)>
+    {
         let mut router = Router::new();
-        for route in routes {
-            let route = Route::new(Get, route, dummy_handler);
-            router.add_route(route);
-        }
-
-        router
-    }
-
-    fn router_with_ranked_routes(routes: &[(isize, &'static str)]) -> Router {
-        let mut router = Router::new();
-        for &(rank, route) in routes {
+        for (rank, route) in routes {
             let route = Route::ranked(rank, Get, route, dummy_handler);
-            router.add_route(route);
+            router.routes.push(route);
         }
 
-        router
+        router.finalize()
     }
 
-    fn router_with_rankless_routes(routes: &[&'static str]) -> Router {
-        let mut router = Router::new();
-        for route in routes {
-            let route = Route::ranked(0, Get, route, dummy_handler);
-            router.add_route(route);
-        }
+    fn router_with_routes(routes: &[&'static str]) -> Router<Finalized> {
+        make_router(routes.iter().map(|r| (None, *r))).unwrap()
+    }
 
-        router
+    fn router_with_ranked_routes(routes: &[(isize, &'static str)]) -> Router<Finalized> {
+        make_router(routes.iter().map(|r| (Some(r.0), r.1))).unwrap()
     }
 
     fn rankless_route_collisions(routes: &[&'static str]) -> bool {
-        let router = router_with_rankless_routes(routes);
-        router.has_collisions()
+        make_router(routes.iter().map(|r| (Some(0), *r))).is_err()
     }
 
     fn default_rank_route_collisions(routes: &[&'static str]) -> bool {
-        let router = router_with_routes(routes);
-        router.has_collisions()
+        make_router(routes.iter().map(|r| (None, *r))).is_err()
     }
 
     #[test]
@@ -175,13 +195,7 @@ mod test {
         assert!(rankless_route_collisions(&["/", "/<a..>"]));
         assert!(rankless_route_collisions(&["/a/<_>", "/a/<a..>"]));
         assert!(rankless_route_collisions(&["/a/<_>", "/a/<_..>"]));
-        assert!(rankless_route_collisions(&["/<_>", "/a/<_..>"]));
-        assert!(rankless_route_collisions(&["/foo", "/foo/<_..>"]));
         assert!(rankless_route_collisions(&["/foo/bar/baz", "/foo/<_..>"]));
-        assert!(rankless_route_collisions(&["/a/d/<b..>", "/a/d"]));
-        assert!(rankless_route_collisions(&["/a/<_..>", "/<_>"]));
-        assert!(rankless_route_collisions(&["/a/<_..>", "/a"]));
-        assert!(rankless_route_collisions(&["/<a>", "/a/<a..>"]));
 
         assert!(rankless_route_collisions(&["/<_>", "/<_>"]));
         assert!(rankless_route_collisions(&["/a/<_>", "/a/b"]));
@@ -190,19 +204,16 @@ mod test {
         assert!(rankless_route_collisions(&["/<_..>", "/<_>"]));
         assert!(rankless_route_collisions(&["/<_>/b", "/a/b"]));
         assert!(rankless_route_collisions(&["/", "/<foo..>"]));
+        assert!(rankless_route_collisions(&["/<_>", "/"]));
     }
 
     #[test]
     fn test_collisions_normalize() {
-        assert!(rankless_route_collisions(&["/hello/", "/hello"]));
-        assert!(rankless_route_collisions(&["//hello/", "/hello"]));
         assert!(rankless_route_collisions(&["//hello/", "/hello//"]));
-        assert!(rankless_route_collisions(&["/<a>", "/hello//"]));
-        assert!(rankless_route_collisions(&["/<a>", "/hello///"]));
         assert!(rankless_route_collisions(&["/hello///bob", "/hello/<b>"]));
-        assert!(rankless_route_collisions(&["/<a..>//", "/a//<a..>"]));
         assert!(rankless_route_collisions(&["/a/<a..>//", "/a/<a..>"]));
         assert!(rankless_route_collisions(&["/a/<a..>//", "/a/b//c//d/"]));
+        assert!(rankless_route_collisions(&["/<a..>//", "/a//<a..>"]));
         assert!(rankless_route_collisions(&["/a/<a..>/", "/a/bd/e/"]));
         assert!(rankless_route_collisions(&["/<a..>/", "/a/bd/e/"]));
         assert!(rankless_route_collisions(&["//", "/<foo..>"]));
@@ -233,16 +244,28 @@ mod test {
 
     #[test]
     fn test_no_collisions() {
+        assert!(!rankless_route_collisions(&["/a", "/a/"]));
+        assert!(!rankless_route_collisions(&["/<a>", "/hello//"]));
+        assert!(!rankless_route_collisions(&["/<a>", "/hello///"]));
+        assert!(!rankless_route_collisions(&["/hello/", "/hello"]));
+        assert!(!rankless_route_collisions(&["//hello/", "/hello"]));
         assert!(!rankless_route_collisions(&["/a/b", "/a/b/c"]));
         assert!(!rankless_route_collisions(&["/a/b/c/d", "/a/b/c/<d>/e"]));
         assert!(!rankless_route_collisions(&["/a/d/<b..>", "/a/b/c"]));
-        assert!(!rankless_route_collisions(&["/<_>", "/"]));
         assert!(!rankless_route_collisions(&["/a/<_>", "/a"]));
         assert!(!rankless_route_collisions(&["/a/<_>", "/<_>"]));
+        assert!(!rankless_route_collisions(&["/a/<b>/<c..>", "/a/<c>"]));
+        assert!(!rankless_route_collisions(&["/<_>", "/a/<_..>"]));
+        assert!(!rankless_route_collisions(&["/foo", "/foo/<_..>"]));
+        assert!(!rankless_route_collisions(&["/a/<_..>", "/<_>"]));
+        assert!(!rankless_route_collisions(&["/a/<_..>", "/a"]));
+        assert!(!rankless_route_collisions(&["/<a>", "/a/<a..>"]));
+        assert!(!rankless_route_collisions(&["/a/d/<b..>", "/a/d"]));
     }
 
     #[test]
     fn test_no_collision_when_ranked() {
+        assert!(!default_rank_route_collisions(&["/<_>", "/"]));
         assert!(!default_rank_route_collisions(&["/<a>", "/hello"]));
         assert!(!default_rank_route_collisions(&["/hello/bob", "/hello/<b>"]));
         assert!(!default_rank_route_collisions(&["/a/b/c/d", "/<a>/<b>/c/d"]));
@@ -262,11 +285,11 @@ mod test {
         assert!(!default_rank_route_collisions(&["/<a..>", "/hello"]));
         assert!(!default_rank_route_collisions(&["/<a>", "/a/<path..>"]));
         assert!(!default_rank_route_collisions(&["/a/<b>/c", "/<d>/<c..>"]));
+        assert!(!default_rank_route_collisions(&["/a/<b>/<c..>", "/a/<c>"]));
     }
 
     #[test]
     fn test_collision_when_ranked() {
-        assert!(default_rank_route_collisions(&["/a/<b>/<c..>", "/a/<c>"]));
         assert!(default_rank_route_collisions(&["/<a>/b", "/a/<b>"]));
     }
 
@@ -286,13 +309,15 @@ mod test {
         assert!(!default_rank_route_collisions(&["/<foo>?a=b", "/<foo>?c=d&<d>"]));
     }
 
-    fn matches<'a>(router: &'a Router, method: Method, uri: &'a str) -> Vec<&'a Route> {
+    #[track_caller]
+    fn matches<'a>(router: &'a Router<Finalized>, method: Method, uri: &'a str) -> Vec<&'a Route> {
         let client = Client::debug_with(vec![]).expect("client");
         let request = client.req(method, Origin::parse(uri).unwrap());
         router.route(&request).collect()
     }
 
-    fn route<'a>(router: &'a Router, method: Method, uri: &'a str) -> Option<&'a Route> {
+    #[track_caller]
+    fn route<'a>(router: &'a Router<Finalized>, method: Method, uri: &'a str) -> Option<&'a Route> {
         matches(router, method, uri).into_iter().next()
     }
 
@@ -302,6 +327,7 @@ mod test {
         assert!(route(&router, Get, "/hello").is_some());
 
         let router = router_with_routes(&["/<a>"]);
+        assert!(route(&router, Get, "/").is_some());
         assert!(route(&router, Get, "/hello").is_some());
         assert!(route(&router, Get, "/hi").is_some());
         assert!(route(&router, Get, "/bobbbbbbbbbby").is_some());
@@ -309,14 +335,15 @@ mod test {
 
         let router = router_with_routes(&["/<a>/<b>"]);
         assert!(route(&router, Get, "/hello/hi").is_some());
-        assert!(route(&router, Get, "/a/b/").is_some());
         assert!(route(&router, Get, "/i/a").is_some());
         assert!(route(&router, Get, "/jdlk/asdij").is_some());
+        assert!(route(&router, Get, "/a/").is_some());
 
         let mut router = Router::new();
-        router.add_route(Route::new(Put, "/hello", dummy_handler));
-        router.add_route(Route::new(Post, "/hello", dummy_handler));
-        router.add_route(Route::new(Delete, "/hello", dummy_handler));
+        router.routes.push(Route::new(Put, "/hello", dummy_handler));
+        router.routes.push(Route::new(Post, "/hello", dummy_handler));
+        router.routes.push(Route::new(Delete, "/hello", dummy_handler));
+        let router = router.finalize().unwrap();
         assert!(route(&router, Put, "/hello").is_some());
         assert!(route(&router, Post, "/hello").is_some());
         assert!(route(&router, Delete, "/hello").is_some());
@@ -331,7 +358,7 @@ mod test {
         assert!(route(&router, Get, "/a/b/c/d/e/f").is_some());
 
         let router = router_with_routes(&["/foo/<a..>"]);
-        assert!(route(&router, Get, "/foo").is_some());
+        assert!(route(&router, Get, "/foo").is_none());
         assert!(route(&router, Get, "/foo/").is_some());
         assert!(route(&router, Get, "/foo///bar").is_some());
     }
@@ -352,16 +379,16 @@ mod test {
         assert!(route(&router, Put, "/hello").is_none());
         assert!(route(&router, Post, "/hello").is_none());
         assert!(route(&router, Options, "/hello").is_none());
-        assert!(route(&router, Get, "/hello/there").is_none());
-        assert!(route(&router, Get, "/hello/i").is_none());
+        assert!(route(&router, Get, "/hello/").is_none());
+        assert!(route(&router, Get, "/hello/there/").is_none());
+        assert!(route(&router, Get, "/hello/there/").is_none());
 
         let router = router_with_routes(&["/<a>/<b>"]);
         assert!(route(&router, Get, "/a/b/c").is_none());
         assert!(route(&router, Get, "/a").is_none());
-        assert!(route(&router, Get, "/a/").is_none());
         assert!(route(&router, Get, "/a/b/c/d").is_none());
+        assert!(route(&router, Get, "/a/b/").is_none());
         assert!(route(&router, Put, "/hello/hi").is_none());
-        assert!(route(&router, Put, "/a/b").is_none());
         assert!(route(&router, Put, "/a/b").is_none());
 
         let router = router_with_routes(&["/prefix/<a..>"]);
@@ -369,12 +396,13 @@ mod test {
         assert!(route(&router, Get, "/prefi/").is_none());
     }
 
+    /// Asserts that `$to` routes to `$want` given `$routes` are present.
     macro_rules! assert_ranked_match {
         ($routes:expr, $to:expr => $want:expr) => ({
             let router = router_with_routes($routes);
-            assert!(!router.has_collisions());
             let route_path = route(&router, Get, $to).unwrap().uri.to_string();
-            assert_eq!(route_path, $want.to_string());
+            assert_eq!(route_path, $want.to_string(),
+                "\nmatched {} with {}, wanted {} in {:#?}", $to, route_path, $want, router);
         })
     }
 
@@ -404,8 +432,7 @@ mod test {
     }
 
     fn ranked_collisions(routes: &[(isize, &'static str)]) -> bool {
-        let router = router_with_ranked_routes(routes);
-        router.has_collisions()
+        make_router(routes.iter().map(|r| (Some(r.0), r.1))).is_err()
     }
 
     #[test]
@@ -432,7 +459,7 @@ mod test {
             let router = router_with_ranked_routes(&$routes);
             let routed_to = matches(&router, Get, $to);
             let expected = &[$($want),+];
-            assert!(routed_to.len() == expected.len());
+            assert_eq!(routed_to.len(), expected.len());
             for (got, expected) in routed_to.iter().zip(expected.iter()) {
                 assert_eq!(got.rank, expected.0);
                 assert_eq!(got.uri.to_string(), expected.1.to_string());
@@ -497,9 +524,9 @@ mod test {
         );
 
         assert_ranked_routing!(
-            to: "/hi",
+            to: "/hi/",
             with: [(1, "/hi/<foo..>"), (0, "/hi/<foo>")],
-            expect: (1, "/hi/<foo..>")
+            expect: (0, "/hi/<foo>"), (1, "/hi/<foo..>")
         );
     }
 
@@ -548,20 +575,21 @@ mod test {
         );
     }
 
-    fn router_with_catchers(catchers: &[(Option<u16>, &str)]) -> Router {
+    fn router_with_catchers(catchers: &[(Option<u16>, &str)]) -> Result<Router<Finalized>> {
         let mut router = Router::new();
         for (code, base) in catchers {
             let catcher = Catcher::new(*code, crate::catcher::dummy_handler);
-            router.add_catcher(catcher.map_base(|_| base.to_string()).unwrap());
+            router.catchers.push(catcher.map_base(|_| base.to_string()).unwrap());
         }
 
-        router
+        router.finalize()
     }
 
-    fn catcher<'a>(router: &'a Router, status: Status, uri: &str) -> Option<&'a Catcher> {
+    #[track_caller]
+    fn catcher<'a>(r: &'a Router<Finalized>, status: Status, uri: &str) -> Option<&'a Catcher> {
         let client = Client::debug_with(vec![]).expect("client");
         let request = client.get(Origin::parse(uri).unwrap());
-        router.catch(status, &request)
+        r.catch(status, &request)
     }
 
     macro_rules! assert_catcher_routing {
@@ -574,12 +602,15 @@ mod test {
             let requests = vec![$($r),+];
             let expected = vec![$(($ecode.into(), $euri)),+];
 
-            let router = router_with_catchers(&catchers);
+            let router = router_with_catchers(&catchers).expect("valid router");
             for (req, expected) in requests.iter().zip(expected.iter()) {
                 let req_status = Status::from_code(req.0).expect("valid status");
                 let catcher = catcher(&router, req_status, req.1).expect("some catcher");
-                assert_eq!(catcher.code, expected.0, "<- got, expected ->");
-                assert_eq!(catcher.base.path(), expected.1, "<- got, expected ->");
+                assert_eq!(catcher.code, expected.0,
+                    "\nmatched {:?}, expected {:?} for req {:?}", catcher, expected, req);
+
+                assert_eq!(catcher.base.path(), expected.1,
+                    "\nmatched {:?}, expected {:?} for req {:?}", catcher, expected, req);
             }
         })
     }

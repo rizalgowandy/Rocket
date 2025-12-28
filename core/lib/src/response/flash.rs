@@ -178,9 +178,9 @@ impl<R> Flash<R> {
         let content = format!("{}{}{}{}",
             self.kind.len(), FLASH_COOKIE_DELIM, self.kind, self.message);
 
-        Cookie::build(FLASH_COOKIE_NAME, content)
+        Cookie::build((FLASH_COOKIE_NAME, content))
             .max_age(Duration::minutes(5))
-            .finish()
+            .build()
     }
 }
 
@@ -211,7 +211,7 @@ impl<'r> FlashMessage<'r> {
     fn clear_cookie_if_needed(&self) {
         // Remove the cookie if it hasn't already been removed.
         if !self.consumed.swap(true, Ordering::Relaxed) {
-            self.inner.remove(Cookie::named(FLASH_COOKIE_NAME));
+            self.inner.remove(FLASH_COOKIE_NAME);
         }
     }
 
@@ -244,10 +244,7 @@ impl<'r> FromRequest<'r> for FlashMessage<'r> {
     type Error = ();
 
     async fn from_request(req: &'r Request<'_>) -> request::Outcome<Self, Self::Error> {
-        trace_!("Flash: attempting to retrieve message.");
         req.cookies().get(FLASH_COOKIE_NAME).ok_or(()).and_then(|cookie| {
-            trace_!("Flash: retrieving message: {:?}", cookie);
-
             // Parse the flash message.
             let content = cookie.value();
             let (len_str, kv) = match content.find(FLASH_COOKIE_DELIM) {
@@ -259,7 +256,7 @@ impl<'r> FromRequest<'r> for FlashMessage<'r> {
                 Ok(i) if i <= kv.len() => Ok(Flash::named(&kv[..i], &kv[i..], req)),
                 _ => Err(())
             }
-        }).into_outcome(Status::BadRequest)
+        }).or_error(Status::BadRequest)
     }
 }
 

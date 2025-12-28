@@ -4,15 +4,14 @@ use crate::Request;
 use crate::outcome::try_outcome;
 use crate::data::{Data, FromData, Outcome};
 use crate::http::{RawStr, ext::IntoOwned};
-use crate::form::parser::{Parser, RawStrParser, Buffer};
-use crate::form::prelude::*;
+use crate::form::prelude::{*, parser::{Parser, RawStrParser}};
 
 /// A data guard for [`FromForm`] types.
 ///
 /// This type implements the [`FromData`] trait. It provides a generic means to
 /// parse arbitrary structures from incoming form data.
 ///
-/// See the [forms guide](https://rocket.rs/v0.5-rc/guide/requests#forms) for
+/// See the [forms guide](https://rocket.rs/master/guide/requests#forms) for
 /// general form support documentation.
 ///
 /// # Leniency
@@ -56,6 +55,26 @@ use crate::form::prelude::*;
 /// can access fields of `T` transparently through a `Form<T>`, as seen above
 /// with `user_input.value`.
 ///
+/// ## Errors
+///
+/// A `Form<T>` data guard may fail, forward, or succeed.
+///
+/// If a request's content-type is neither [`ContentType::Form`] nor
+/// [`ContentType::FormData`], the guard **forwards**.
+///
+/// If the request `ContentType` _does_ identify as a form but the form data
+/// does not parse as `T`, according to `T`'s [`FromForm`] implementation, the
+/// guard **fails**. The `Error` variant contains a vector of the [`Errors`]
+/// emitted by `T`'s `FromForm` parser. If the error is not caught by a
+/// [`form::Result<T>`](Result) or `Option<Form<T>>` data guard, the status code
+/// is set to [`Errors::status()`], and the corresponding error catcher is
+/// called.
+///
+/// Otherwise the guard **succeeds**.
+///
+/// [`ContentType::Form`]: crate::http::ContentType::Form
+/// [`ContentType::FormData`]: crate::http::ContentType::FormData
+///
 /// ## Data Limits
 ///
 /// The total amount of data accepted by the `Form` data guard is limited by the
@@ -84,7 +103,7 @@ use crate::form::prelude::*;
 /// The `data-form` limit specifies the data limit for an entire multipart form
 /// data stream. It defaults to 2MiB. Multipart data is streamed, and form
 /// fields are processed into [`DataField`]s or [`ValueField`]s as they arrive.
-/// If the commulative data received while streaming exceeds the limit, parsing
+/// If the commutative data received while streaming exceeds the limit, parsing
 /// is aborted, an error is created and pushed via [`FromForm::push_error()`],
 /// and the form is finalized.
 ///
@@ -244,7 +263,7 @@ impl<T: for<'a> FromForm<'a> + 'static> Form<T> {
     /// assert_eq!(pet.wags, true);
     /// ```
     pub fn parse_encoded(string: &RawStr) -> Result<'static, T> {
-        let buffer = Buffer::new();
+        let buffer = SharedStack::new();
         let mut ctxt = T::init(Options::Lenient);
         for field in RawStrParser::new(&buffer, string) {
             T::push_value(&mut ctxt, field)
@@ -314,7 +333,7 @@ impl<'r, T: FromForm<'r>> FromData<'r> for Form<T> {
 
         match T::finalize(context) {
             Ok(value) => Outcome::Success(Form(value)),
-            Err(e) => Outcome::Failure((e.status(), e)),
+            Err(e) => Outcome::Error((e.status(), e)),
         }
     }
 }

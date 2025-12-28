@@ -1,5 +1,3 @@
-use std::collections::hash_set::HashSet;
-
 use criterion::{criterion_group, Criterion};
 
 use rocket::{route, config, Request, Data, Route, Config};
@@ -45,13 +43,13 @@ fn generate_matching_requests<'c>(client: &'c Client, routes: &[Route]) -> Vec<L
     }
 
     fn request_for_route<'c>(client: &'c Client, route: &Route) -> LocalRequest<'c> {
-        let path = route.uri.origin.path()
+        let path = route.uri.path()
             .raw_segments()
             .map(staticify_segment)
             .collect::<Vec<_>>()
             .join("/");
 
-        let query = route.uri.origin.query()
+        let query = route.uri.query()
             .map(|q| q.raw_segments())
             .into_iter()
             .flatten()
@@ -60,9 +58,9 @@ fn generate_matching_requests<'c>(client: &'c Client, routes: &[Route]) -> Vec<L
             .join("&");
 
         let uri = format!("/{}?{}", path, query);
-        let mut req = client.req(route.method, uri);
+        let mut req = client.req(route.method.unwrap(), uri);
         if let Some(ref format) = route.format {
-            if route.method.supports_payload() {
+            if let Some(true) = route.method.and_then(|m| m.allows_request_body()) {
                 req.add_header(ContentType::from(format.clone()));
             } else {
                 req.add_header(Accept::from(format.clone()));
@@ -80,12 +78,12 @@ fn generate_matching_requests<'c>(client: &'c Client, routes: &[Route]) -> Vec<L
 fn client(routes: Vec<Route>) -> Client {
     let config = Config {
         profile: Config::RELEASE_PROFILE,
-        log_level: rocket::config::LogLevel::Off,
-        cli_colors: false,
-        shutdown: config::Shutdown {
+        log_level: None,
+        cli_colors: config::CliColors::Never,
+        shutdown: config::ShutdownConfig {
             ctrlc: false,
             #[cfg(unix)]
-            signals: HashSet::new(),
+            signals: std::collections::hash_set::HashSet::new(),
             ..Default::default()
         },
         ..Default::default()

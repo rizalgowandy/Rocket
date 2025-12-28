@@ -1,5 +1,6 @@
 use std::fmt;
-use std::convert::TryInto;
+
+use rocket_http::HttpVersion;
 
 use crate::{Request, Data};
 use crate::http::{Status, Method};
@@ -24,8 +25,8 @@ use super::{Client, LocalResponse};
 /// let client = Client::tracked(rocket::build()).await.expect("valid rocket");
 /// let req = client.post("/")
 ///     .header(ContentType::JSON)
-///     .remote("127.0.0.1:8000".parse().unwrap())
-///     .cookie(Cookie::new("name", "value"))
+///     .remote("127.0.0.1:8000")
+///     .cookie(("name", "value"))
 ///     .body(r#"{ "value": 42 }"#);
 ///
 /// let response = req.dispatch().await;
@@ -49,7 +50,7 @@ impl<'c> LocalRequest<'c> {
 
         // Create a request. We'll handle bad URIs later, in `_dispatch`.
         let origin = try_origin.clone().unwrap_or_else(|bad| bad);
-        let mut request = Request::new(client.rocket(), method, origin);
+        let mut request = Request::new(client.rocket(), method, origin, None);
 
         // Add any cookies we know about.
         if client.tracked {
@@ -61,6 +62,11 @@ impl<'c> LocalRequest<'c> {
         }
 
         LocalRequest { client, request, uri: try_origin, data: vec![] }
+    }
+
+    #[inline]
+    pub fn override_version(&mut self, version: HttpVersion) {
+        self.version = Some(version);
     }
 
     pub(crate) fn _request(&self) -> &Request<'c> {
@@ -87,14 +93,14 @@ impl<'c> LocalRequest<'c> {
             if self.inner().uri() == invalid {
                 error!("invalid request URI: {:?}", invalid.path());
                 return LocalResponse::new(self.request, move |req| {
-                    rocket.handle_error(Status::BadRequest, req)
+                    rocket.dispatch_error(Status::BadRequest, req)
                 }).await
             }
         }
 
         // Actually dispatch the request.
         let mut data = Data::local(self.data);
-        let token = rocket.preprocess_request(&mut self.request, &mut data).await;
+        let token = rocket.preprocess(&mut self.request, &mut data).await;
         let response = LocalResponse::new(self.request, move |req| {
             rocket.dispatch(token, req, data)
         }).await;
@@ -107,7 +113,7 @@ impl<'c> LocalRequest<'c> {
                 for cookie in response.cookies().iter() {
                     if let Some(expires) = cookie.expires_datetime() {
                         if expires <= current_time {
-                            jar.force_remove(cookie);
+                            jar.force_remove(cookie.name());
                             continue;
                         }
                     }

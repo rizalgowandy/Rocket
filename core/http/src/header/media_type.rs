@@ -5,11 +5,8 @@ use std::hash::{Hash, Hasher};
 
 use either::Either;
 
-use crate::ext::IntoCollection;
 use crate::uncased::UncasedStr;
 use crate::parse::{Indexed, IndexedStr, parse_media_type};
-
-use smallvec::SmallVec;
 
 /// An HTTP media type.
 ///
@@ -51,21 +48,21 @@ use smallvec::SmallVec;
 /// [`exact_eq()`](MediaType::exact_eq()) method can be used.
 #[derive(Debug, Clone)]
 pub struct MediaType {
-    /// Storage for the entire media type string.
+    /// InitCell for the entire media type string.
     pub(crate) source: Source,
     /// The top-level type.
     pub(crate) top: IndexedStr<'static>,
     /// The subtype.
     pub(crate) sub: IndexedStr<'static>,
     /// The parameters, if any.
-    pub(crate) params: MediaParams
+    pub(crate) params: MediaParams,
 }
 
-// FIXME: `Static` variant is needed for `const`. Need `const SmallVec::new`.
+// TODO: `Static` variant is needed for `const`.
 #[derive(Debug, Clone)]
 pub(crate) enum MediaParams {
     Static(&'static [(&'static str, &'static str)]),
-    Dynamic(SmallVec<[(IndexedStr<'static>, IndexedStr<'static>); 2]>)
+    Dynamic(Vec<(IndexedStr<'static>, IndexedStr<'static>)>)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,15 +82,13 @@ macro_rules! media_types {
     ($($name:ident ($check:ident): $str:expr, $t:expr,
         $s:expr $(; $k:expr => $v:expr)*,)+) => {
     $(
-        docify!([
-            Media Type for @{"**"}! @{$str}! @{"**"}!: @{"`"} @{$t}! @[/]! @{$s}!
-            $(; @{$k}! @[=]! @{$v}!)* @{"`"}!.
-        ];
-            #[allow(non_upper_case_globals)]
-            pub const $name: MediaType = MediaType::new_known(
-                concat!($t, "/", $s, $("; ", $k, "=", $v),*),
-                $t, $s, &[$(($k, $v)),*]
-            );
+        /// Media Type for
+        #[doc = concat!("**", $str, "**: ")]
+        #[doc = concat!("`", $t, "/", $s, $("; ", $k, "=", $v,)* "`")]
+        #[allow(non_upper_case_globals)]
+        pub const $name: MediaType = MediaType::new_known(
+            concat!($t, "/", $s, $("; ", $k, "=", $v),*),
+            $t, $s, &[$(($k, $v)),*]
         );
     )+
 
@@ -109,33 +104,32 @@ macro_rules! media_types {
     }
 
     $(
-        docify!([
-            Returns @code{true} if the @[top-level] and sublevel types of
-            @code{self} are the same as those of @{"`MediaType::"}! $name
-            @{"`"}!.
-        ];
-            #[inline(always)]
-            pub fn $check(&self) -> bool {
-                *self == MediaType::$name
-            }
-        );
+        /// Returns `true` if the top-level and sublevel types of
+        /// `self` are the same as those of
+        #[doc = concat!("`MediaType::", stringify!($name), "`, ")]
+        /// i.e
+        #[doc = concat!("`", $t, "/", $s, "`.")]
+        #[inline(always)]
+        pub fn $check(&self) -> bool {
+            *self == MediaType::$name
+        }
     )+
 }}
 
 macro_rules! from_extension {
     ($($ext:expr => $name:ident,)*) => (
-    docify!([
-        Returns the @[Media-Type] associated with the extension @code{ext}. Not
-        all extensions are recognized. If an extensions is not recognized,
-        @code{None} is returned. The currently recognized extensions are:
-
-        @nl
-        $(* @{$ext} - @{"`MediaType::"}! @[$name]! @{"`"} @nl)*
-        @nl
-
-        This list is likely to grow. Extensions are matched
-        @[case-insensitively.]
-    ];
+        /// Returns the Media Type associated with the extension `ext`.
+        ///
+        /// Extensions are matched case-insensitively. Not all extensions are
+        /// recognized. If an extensions is not recognized, `None` is returned.
+        /// The currently recognized extensions are:
+        ///
+        $(
+            #[doc = concat!("* ", $ext, " - [`MediaType::", stringify!($name), "`]")]
+        )*
+        ///
+        /// This list is likely to grow.
+        ///
         /// # Example
         ///
         /// Recognized media types:
@@ -166,19 +160,18 @@ macro_rules! from_extension {
                 _ => None
             }
         }
-    );)
+    )
 }
 
 macro_rules! extension {
     ($($ext:expr => $name:ident,)*) => (
-    docify!([
-        Returns the most common file extension associated with the @[Media-Type]
-        @code{self} if it is known. Otherwise, returns @code{None}. The
-        currently recognized extensions are identical to those in
-        @{"[`MediaType::from_extension()`]"} with the @{"most common"} extension
-        being the first extension appearing in the list for a given
-        @[Media-Type].
-    ];
+        /// Returns the most common file extension associated with the
+        /// Media-Type `self` if it is known. Otherwise, returns `None`.
+        ///
+        /// The currently recognized extensions are identical to those in
+        /// [`MediaType::from_extension()`] with the most common extension being
+        /// the first extension appearing in the list for a given Content-Type.
+        ///
         /// # Example
         ///
         /// Known extension:
@@ -207,22 +200,20 @@ macro_rules! extension {
             $(if self == &MediaType::$name { return Some($ext.into()) })*
             None
         }
-    );)
+    )
 }
 
 macro_rules! parse_flexible {
     ($($short:expr => $name:ident,)*) => (
-    docify!([
-        Flexibly parses @code{name} into a @code{MediaType}. The parse is
-        @[_flexible_] because, in addition to stricly correct media types, it
-        recognizes the following shorthands:
-
-        @nl
-        $(* $short - @{"`MediaType::"}! @[$name]! @{"`"} @nl)*
-        @nl
-    ];
-        /// For regular parsing, use the
-        /// [`MediaType::from_str()`](#impl-FromStr) method.
+        /// Flexibly parses `name` into a [`MediaType`]. The parse is
+        /// _flexible_ because, in addition to strictly correct content types,
+        /// it recognizes the following shorthands:
+        ///
+        $(
+            #[doc = concat!("* ", $short, " - [`MediaType::", stringify!($name), "`]")]
+        )*
+        ///
+        /// For regular parsing, use [`MediaType::from_str()`].
         ///
         /// # Example
         ///
@@ -273,7 +264,7 @@ macro_rules! parse_flexible {
                 _ => MediaType::from_str(name).ok(),
             }
         }
-    );)
+    )
 }
 
 impl MediaType {
@@ -315,7 +306,7 @@ impl MediaType {
     /// # extern crate rocket;
     /// use rocket::http::MediaType;
     ///
-    /// let id = MediaType::new("application", "x-id").with_params(("id", "1"));
+    /// let id = MediaType::new("application", "x-id").with_params([("id", "1")]);
     /// assert_eq!(id.to_string(), "application/x-id; id=1".to_string());
     /// ```
     ///
@@ -333,11 +324,12 @@ impl MediaType {
     pub fn with_params<K, V, P>(mut self, ps: P) -> MediaType
         where K: Into<Cow<'static, str>>,
               V: Into<Cow<'static, str>>,
-              P: IntoCollection<(K, V)>
+              P: IntoIterator<Item = (K, V)>
     {
-        use Indexed::Concrete;
+        let params = ps.into_iter()
+            .map(|(k, v)| (Indexed::Concrete(k.into()), Indexed::Concrete(v.into())))
+            .collect();
 
-        let params = ps.mapped(|(k, v)| (Concrete(k.into()), Concrete(v.into())));
         self.params = MediaParams::Dynamic(params);
         self
     }
@@ -467,13 +459,15 @@ impl MediaType {
 
     /// Compares `self` with `other` and returns `true` if `self` and `other`
     /// are exactly equal to each other, including with respect to their
-    /// parameters.
+    /// parameters and their order.
     ///
     /// This is different from the `PartialEq` implementation in that it
-    /// considers parameters. If `PartialEq` returns false, this function is
-    /// guaranteed to return false. Similarly, if this function returns `true`,
-    /// `PartialEq` is guaranteed to return true. However, if `PartialEq`
-    /// returns `true`, this function may or may not return `true`.
+    /// considers parameters. In particular, `Eq` implies `PartialEq` but
+    /// `PartialEq` does not imply `Eq`. That is, if `PartialEq` returns false,
+    /// this function is guaranteed to return false. Similarly, if `exact_eq`
+    /// returns `true`, `PartialEq` is guaranteed to return true. However, if
+    /// `PartialEq` returns `true`, `exact_eq` function may or may not return
+    /// `true`.
     ///
     /// # Example
     ///
@@ -482,7 +476,7 @@ impl MediaType {
     /// use rocket::http::MediaType;
     ///
     /// let plain = MediaType::Plain;
-    /// let plain2 = MediaType::new("text", "plain").with_params(("charset", "utf-8"));
+    /// let plain2 = MediaType::new("text", "plain").with_params([("charset", "utf-8")]);
     /// let just_plain = MediaType::new("text", "plain");
     ///
     /// // The `PartialEq` implementation doesn't consider parameters.
@@ -531,7 +525,7 @@ impl MediaType {
         let raw = match self.params {
             MediaParams::Static(slice) => Either::Left(slice.iter().cloned()),
             MediaParams::Dynamic(ref vec) => {
-                Either::Right(vec.iter().map(move |&(ref key, ref val)| {
+                Either::Right(vec.iter().map(move |(key, val)| {
                     let source_str = self.source.as_str();
                     (key.from_source(source_str), val.from_source(source_str))
                 }))
@@ -572,16 +566,13 @@ impl PartialEq for MediaType {
     }
 }
 
+impl Eq for MediaType {  }
+
 impl Hash for MediaType {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.top().hash(state);
         self.sub().hash(state);
-
-        for (key, val) in self.params() {
-            key.hash(state);
-            val.hash(state);
-        }
     }
 }
 
@@ -601,9 +592,19 @@ impl fmt::Display for MediaType {
     }
 }
 
+impl IntoIterator for MediaType {
+    type Item = Self;
+
+    type IntoIter = std::iter::Once<Self>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        std::iter::once(self)
+    }
+}
+
 impl Default for MediaParams {
     fn default() -> Self {
-        MediaParams::Dynamic(SmallVec::new())
+        MediaParams::Dynamic(Vec::new())
     }
 }
 

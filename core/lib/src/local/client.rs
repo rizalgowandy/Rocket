@@ -68,7 +68,12 @@ macro_rules! pub_client_impl {
     /// ```
     #[inline(always)]
     pub $($prefix)? fn tracked<P: Phase>(rocket: Rocket<P>) -> Result<Self, Error> {
-        Self::_new(rocket, true) $(.$suffix)?
+        Self::_new(rocket, true, false) $(.$suffix)?
+    }
+
+    #[inline(always)]
+    pub $($prefix)? fn tracked_secure<P: Phase>(rocket: Rocket<P>) -> Result<Self, Error> {
+        Self::_new(rocket, true, true) $(.$suffix)?
     }
 
     /// Construct a new `Client` from an instance of `Rocket` _without_
@@ -92,7 +97,34 @@ macro_rules! pub_client_impl {
     /// let client = Client::untracked(rocket);
     /// ```
     pub $($prefix)? fn untracked<P: Phase>(rocket: Rocket<P>) -> Result<Self, Error> {
-        Self::_new(rocket, false) $(.$suffix)?
+        Self::_new(rocket, false, false) $(.$suffix)?
+    }
+
+    pub $($prefix)? fn untracked_secure<P: Phase>(rocket: Rocket<P>) -> Result<Self, Error> {
+        Self::_new(rocket, false, true) $(.$suffix)?
+    }
+
+    /// Terminates `Client` by initiating a graceful shutdown via
+    /// [`Shutdown::notify()`] and running shutdown fairings.
+    ///
+    /// This method _must_ be called on a `Client` if graceful shutdown is
+    /// required for testing as `Drop` _does not_ signal `Shutdown` nor run
+    /// shutdown fairings. Returns the instance of `Rocket` being managed by
+    /// this client after all shutdown fairings run to completion.
+    ///
+    /// [`Shutdown::notify()`]: crate::Shutdown::notify()
+    ///
+    /// ```rust,no_run
+    #[doc = $import]
+    ///
+    /// # fn f(client: Client) {
+    /// let client: Client = client;
+    /// let rocket = client.terminate();
+    /// # }
+    /// ```
+    #[inline(always)]
+    pub $($prefix)? fn terminate(self) -> Rocket<Ignite> {
+        Self::_terminate(self) $(.$suffix)?
     }
 
     #[doc(hidden)]
@@ -106,19 +138,10 @@ macro_rules! pub_client_impl {
         use crate::config;
 
         let figment = rocket.figment().clone()
-            .merge((config::Config::LOG_LEVEL, config::LogLevel::Debug))
+            .merge((config::Config::LOG_LEVEL, "debug"))
             .select(config::Config::DEBUG_PROFILE);
 
-        Self::tracked(rocket.configure(figment)) $(.$suffix)?
-    }
-
-    /// Deprecated alias to [`Client::tracked()`].
-    #[deprecated(
-        since = "0.5.0",
-        note = "choose between `Client::untracked()` and `Client::tracked()`"
-    )]
-    pub $($prefix)? fn new<P: Phase>(rocket: Rocket<P>) -> Result<Self, Error> {
-        Self::tracked(rocket) $(.$suffix)?
+        Self::tracked(rocket.reconfigure(figment)) $(.$suffix)?
     }
 
     /// Returns a reference to the `Rocket` this client is creating requests
@@ -158,9 +181,8 @@ macro_rules! pub_client_impl {
     /// ```
     #[inline(always)]
     pub fn cookies(&self) -> crate::http::CookieJar<'_> {
-        let config = &self.rocket().config();
         let jar = self._with_raw_cookies(|jar| jar.clone());
-        crate::http::CookieJar::from(jar, config)
+        crate::http::CookieJar::new(Some(jar), self.rocket())
     }
 
     req_method!($import, "GET", get, Method::Get);

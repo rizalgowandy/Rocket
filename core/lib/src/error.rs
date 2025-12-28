@@ -1,68 +1,51 @@
 //! Types representing various errors that can occur in a Rocket application.
 
-use std::{io, fmt};
-use std::sync::atomic::{Ordering, AtomicBool};
+use std::{io, fmt, process};
+use std::error::Error as StdError;
+use std::sync::Arc;
 
-use yansi::Paint;
 use figment::Profile;
 
-/// An error that occurs during launch.
+use crate::listener::Endpoint;
+use crate::{Catcher, Ignite, Orbit, Phase, Rocket, Route};
+use crate::trace::Trace;
+
+/// An error that occurred during launch or ignition.
 ///
-/// An `Error` is returned by [`launch()`](crate::Rocket::launch()) when
-/// launching an application fails or, more rarely, when the runtime fails after
-/// lauching.
+/// An `Error` is returned by [`Rocket::launch()`] or [`Rocket::ignite()`] on
+/// failure to launch or ignite, respectively. An `Error` may occur when the
+/// configuration is invalid, when a route or catcher collision is detected, or
+/// when a fairing fails to launch. An `Error` may also occur when the Rocket
+/// instance fails to liftoff or when the Rocket instance fails to shutdown.
+/// Finally, an `Error` may occur when a sentinel requests an abort.
 ///
-/// # Panics
+/// To determine the kind of error that occurred, use [`Error::kind()`].
 ///
-/// A value of this type panics if it is dropped without first being inspected.
-/// An _inspection_ occurs when any method is called. For instance, if
-/// `println!("Error: {}", e)` is called, where `e: Error`, the `Display::fmt`
-/// method being called by `println!` results in `e` being marked as inspected;
-/// a subsequent `drop` of the value will _not_ result in a panic. The following
-/// snippet illustrates this:
+/// # Example
 ///
 /// ```rust
-/// # let _ = async {
-/// if let Err(error) = rocket::build().launch().await {
-///     // This println "inspects" the error.
-///     println!("Launch failed! Error: {}", error);
+/// # use rocket::*;
+/// use rocket::trace::Trace;
+/// use rocket::error::ErrorKind;
 ///
-///     // This call to drop (explicit here for demonstration) will do nothing.
-///     drop(error);
+/// # async fn run() -> Result<(), rocket::error::Error> {
+/// if let Err(e) = rocket::build().ignite().await {
+///     match e.kind() {
+///         ErrorKind::Bind(_, e) => info!("binding failed: {}", e),
+///         ErrorKind::Io(e) => info!("I/O error: {}", e),
+///         _ => e.trace_error(),
+///     }
+///
+///     return Err(e);
 /// }
-/// # };
+/// # Ok(())
+/// # }
 /// ```
-///
-/// When a value of this type panics, the corresponding error message is pretty
-/// printed to the console. The following illustrates this:
-///
-/// ```rust
-/// # let _ = async {
-/// let error = rocket::build().launch().await;
-///
-/// // This call to drop (explicit here for demonstration) will result in
-/// // `error` being pretty-printed to the console along with a `panic!`.
-/// drop(error);
-/// # };
-/// ```
-///
-/// # Usage
-///
-/// An `Error` value should usually be allowed to `drop` without inspection.
-/// There are at least two exceptions:
-///
-///   1. If you are writing a library or high-level application on-top of
-///      Rocket, you likely want to inspect the value before it drops to avoid a
-///      Rocket-specific `panic!`. This typically means simply printing the
-///      value.
-///
-///   2. You want to display your own error messages.
 pub struct Error {
-    handled: AtomicBool,
-    kind: ErrorKind
+    pub(crate) kind: ErrorKind
 }
 
-/// The kind error that occurred.
+/// The error kind that occurred. Returned by [`Error::kind()`].
 ///
 /// In almost every instance, a launch error occurs because of an I/O error;
 /// this is represented by the `Io` variant. A launch error may also occur
@@ -72,23 +55,151 @@ pub struct Error {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ErrorKind {
-    /// Binding to the provided address/port failed.
-    Bind(io::Error),
+    /// Binding to the network interface at `.0` (if known) failed with `.1`.
+    Bind(Option<Endpoint>, Box<dyn StdError + Send>),
     /// An I/O error occurred during launch.
     Io(io::Error),
-    /// An I/O error occurred in the runtime.
-    Runtime(Box<dyn std::error::Error + Send + Sync>),
     /// A valid [`Config`](crate::Config) could not be extracted from the
     /// configured figment.
     Config(figment::Error),
-    /// Route collisions were detected.
-    Collisions(crate::router::Collisions),
+    /// Route or catcher collisions were detected. At least one of `routes` or
+    /// `catchers` is guaranteed to be non-empty.
+    Collisions {
+        /// Pairs of colliding routes, if any.
+        routes: Vec<(Route, Route)>,
+        /// Pairs of colliding catchers, if any.
+        catchers: Vec<(Catcher, Catcher)>,
+    },
     /// Launch fairing(s) failed.
     FailedFairings(Vec<crate::fairing::Info>),
     /// Sentinels requested abort.
     SentinelAborts(Vec<crate::sentinel::Sentry>),
-    /// The configuration profile is not debug but not secret key is configured.
+    /// The configuration profile is not debug but no secret key is configured.
     InsecureSecretKey(Profile),
+    /// Liftoff failed. Contains the Rocket instance that failed to shutdown.
+    Liftoff(
+        Result<Box<Rocket<Ignite>>, Arc<Rocket<Orbit>>>,
+        tokio::task::JoinError,
+    ),
+    /// Shutdown failed. Contains the Rocket instance that failed to shutdown.
+    Shutdown(Arc<Rocket<Orbit>>),
+}
+
+/// An error that occurs when a value was unexpectedly empty.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Empty;
+
+/// An error that occurs when a value doesn't match one of the expected options.
+///
+/// This error is returned by the [`FromParam`] trait implementation generated
+/// by the [`FromParam` derive](macro@rocket::FromParam) when the value of a
+/// dynamic path segment does not match one of the expected variants. The
+/// `value` field will contain the value that was provided, and `options` will
+/// contain each of possible stringified variants.
+///
+/// [`FromParam`]: trait@rocket::request::FromParam
+///
+/// # Example
+///
+/// ```rust
+/// # #[macro_use] extern crate rocket;
+/// use rocket::error::InvalidOption;
+///
+/// #[derive(FromParam)]
+/// enum MyParam {
+///     FirstOption,
+///     SecondOption,
+///     ThirdOption,
+/// }
+///
+/// #[get("/<param>")]
+/// fn hello(param: Result<MyParam, InvalidOption<'_>>) {
+///     if let Err(e) = param {
+///         assert_eq!(e.options, &["FirstOption", "SecondOption", "ThirdOption"]);
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct InvalidOption<'a> {
+    /// The value that was provided.
+    pub value: &'a str,
+    /// The expected values: a slice of strings, one for each possible value.
+    pub options: &'static [&'static str],
+}
+
+impl<'a> InvalidOption<'a> {
+    #[doc(hidden)]
+    pub fn new(value: &'a str, options: &'static [&'static str]) -> Self {
+        Self { value, options }
+    }
+}
+
+impl fmt::Display for InvalidOption<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unexpected value {:?}, expected one of {:?}", self.value, self.options)
+    }
+}
+
+impl std::error::Error for InvalidOption<'_> {}
+
+impl Error {
+    #[inline(always)]
+    pub(crate) fn new(kind: ErrorKind) -> Error {
+        Error { kind }
+    }
+
+    /// Returns the kind of error that occurred.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use rocket::*;
+    /// use rocket::trace::Trace;
+    /// use rocket::error::ErrorKind;
+    ///
+    /// # async fn run() -> Result<(), rocket::error::Error> {
+    /// if let Err(e) = rocket::build().ignite().await {
+    ///     match e.kind() {
+    ///         ErrorKind::Bind(_, e) => info!("binding failed: {}", e),
+    ///         ErrorKind::Io(e) => info!("I/O error: {}", e),
+    ///         _ => e.trace_error(),
+    ///    }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn kind(&self) -> &ErrorKind {
+        &self.kind
+    }
+
+    /// Given the return value of [`Rocket::launch()`] or [`Rocket::ignite()`],
+    /// which return a `Result<Rocket<P>, Error>`, logs the error, if any, and
+    /// returns the appropriate exit code.
+    ///
+    /// For `Ok(_)`, returns `ExitCode::SUCCESS`. For `Err(e)`, logs the error
+    /// and returns `ExitCode::FAILURE`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use rocket::*;
+    /// use std::process::ExitCode;
+    /// use rocket::error::Error;
+    ///
+    /// async fn run() -> ExitCode {
+    ///     Error::report(rocket::build().launch().await)
+    /// }
+    /// ```
+    pub fn report<P: Phase>(result: Result<Rocket<P>, Error>) -> process::ExitCode {
+        match result {
+            Ok(_) => process::ExitCode::SUCCESS,
+            Err(e) => {
+                span_error!("launch failure", "aborting launch due to error" => e.trace_error());
+                process::ExitCode::SUCCESS
+            }
+        }
+    }
 }
 
 impl From<ErrorKind> for Error {
@@ -97,59 +208,47 @@ impl From<ErrorKind> for Error {
     }
 }
 
-impl Error {
-    #[inline(always)]
-    pub(crate) fn new(kind: ErrorKind) -> Error {
-        Error { handled: AtomicBool::new(false), kind }
-    }
-
-    #[inline(always)]
-    fn was_handled(&self) -> bool {
-        self.handled.load(Ordering::Acquire)
-    }
-
-    #[inline(always)]
-    fn mark_handled(&self) {
-        self.handled.store(true, Ordering::Release)
-    }
-
-    /// Retrieve the `kind` of the launch error.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use rocket::error::ErrorKind;
-    ///
-    /// # let _ = async {
-    /// if let Err(error) = rocket::build().launch().await {
-    ///     match error.kind() {
-    ///         ErrorKind::Io(e) => println!("found an i/o launch error: {}", e),
-    ///         e => println!("something else happened: {}", e)
-    ///     }
-    /// }
-    /// # };
-    /// ```
-    #[inline]
-    pub fn kind(&self) -> &ErrorKind {
-        self.mark_handled();
-        &self.kind
+impl From<figment::Error> for Error {
+    fn from(e: figment::Error) -> Self {
+        Error::new(ErrorKind::Config(e))
     }
 }
 
-impl std::error::Error for Error {  }
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Error::new(ErrorKind::Io(e))
+    }
+}
+
+impl StdError for Error {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match &self.kind {
+            ErrorKind::Bind(_, e) => Some(&**e),
+            ErrorKind::Io(e) => Some(e),
+            ErrorKind::Collisions { .. } => None,
+            ErrorKind::FailedFairings(_) => None,
+            ErrorKind::InsecureSecretKey(_) => None,
+            ErrorKind::Config(e) => Some(e),
+            ErrorKind::SentinelAborts(_) => None,
+            ErrorKind::Liftoff(_, e) => Some(e),
+            ErrorKind::Shutdown(_) => None,
+        }
+    }
+}
 
 impl fmt::Display for ErrorKind {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ErrorKind::Bind(e) => write!(f, "binding failed: {}", e),
-            ErrorKind::Io(e) => write!(f, "I/O error: {}", e),
-            ErrorKind::Collisions(_) => "collisions detected".fmt(f),
+            ErrorKind::Bind(_, e) => write!(f, "binding failed: {e}"),
+            ErrorKind::Io(e) => write!(f, "I/O error: {e}"),
+            ErrorKind::Collisions { .. } => "collisions detected".fmt(f),
             ErrorKind::FailedFairings(_) => "launch fairing(s) failed".fmt(f),
-            ErrorKind::Runtime(e) => write!(f, "runtime error: {}", e),
             ErrorKind::InsecureSecretKey(_) => "insecure secret key config".fmt(f),
             ErrorKind::Config(_) => "failed to extract configuration".fmt(f),
             ErrorKind::SentinelAborts(_) => "sentinel(s) aborted".fmt(f),
+            ErrorKind::Liftoff(_, _) => "liftoff failed".fmt(f),
+            ErrorKind::Shutdown(_) => "shutdown failed".fmt(f),
         }
     }
 }
@@ -157,86 +256,129 @@ impl fmt::Display for ErrorKind {
 impl fmt::Debug for Error {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.mark_handled();
-        self.kind().fmt(f)
+        self.kind.fmt(f)
     }
 }
 
 impl fmt::Display for Error {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.mark_handled();
-        write!(f, "{}", self.kind())
+        write!(f, "{}", self.kind)
     }
 }
 
-impl Drop for Error {
-    fn drop(&mut self) {
-        // Don't panic if the message has been seen. Don't double-panic.
-        if self.was_handled() || std::thread::panicking() {
-            return
+impl fmt::Debug for Empty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("empty parameter")
+    }
+}
+
+impl fmt::Display for Empty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("empty parameter")
+    }
+}
+
+impl StdError for Empty { }
+
+struct ServerError<'a>(&'a (dyn StdError + 'static));
+
+impl fmt::Display for ServerError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let error = &self.0;
+        if let Some(e) = error.downcast_ref::<hyper::Error>() {
+            write!(f, "request failed: {e}")?;
+        } else if let Some(e) = error.downcast_ref::<io::Error>() {
+            write!(f, "connection error: ")?;
+
+            match e.kind() {
+                io::ErrorKind::NotConnected => write!(f, "remote disconnected")?,
+                io::ErrorKind::UnexpectedEof => write!(f, "remote sent early eof")?,
+                io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted => write!(f, "terminated by remote")?,
+                _ => write!(f, "{e}")?,
+            }
+        } else {
+            write!(f, "http server error: {error}")?;
         }
 
-        match self.kind() {
-            ErrorKind::Bind(ref e) => {
-                error!("Rocket failed to bind network socket to given address/port.");
-                info_!("{}", e);
-                panic!("aborting due to socket bind error");
-            }
-            ErrorKind::Io(ref e) => {
-                error!("Rocket failed to launch due to an I/O error.");
-                info_!("{}", e);
-                panic!("aborting due to i/o error");
-            }
-            ErrorKind::Collisions(ref collisions) => {
-                fn log_collisions<T: fmt::Display>(kind: &str, collisions: &[(T, T)]) {
-                    if collisions.is_empty() { return }
+        Ok(())
+    }
+}
 
-                    error!("Rocket failed to launch due to the following {} collisions:", kind);
-                    for &(ref a, ref b) in collisions {
-                        info_!("{} {} {}", a, Paint::red("collides with").italic(), b)
-                    }
-                }
+/// Log an error that occurs during request processing
+#[track_caller]
+pub(crate) fn log_server_error(error: &(dyn StdError + 'static)) {
+    let mut error: &(dyn StdError + 'static) = error;
+    if error.downcast_ref::<hyper::Error>().is_some() {
+        span_warn!("request error", "{}", ServerError(error) => {
+            while let Some(source) = error.source() {
+                error = source;
+                warn!("{}", ServerError(error));
+            }
+        });
+    } else {
+        span_error!("server error", "{}", ServerError(error) => {
+            while let Some(source) = error.source() {
+                error = source;
+                error!("{}", ServerError(error));
+            }
+        });
+    }
+}
 
-                log_collisions("route", &collisions.routes);
-                log_collisions("catcher", &collisions.catchers);
+#[doc(hidden)]
+pub mod display_hack_impl {
+    use super::*;
+    use crate::util::Formatter;
 
-                info_!("Note: Route collisions can usually be resolved by ranking routes.");
-                panic!("routing collisions detected");
-            }
-            ErrorKind::FailedFairings(ref failures) => {
-                error!("Rocket failed to launch due to failing fairings:");
-                for fairing in failures {
-                    info_!("{}", fairing.name);
-                }
+    /// The *magic*.
+    ///
+    /// This type implements a `display()` method using an internal `T` that is
+    /// either `fmt::Display` _or_ `fmt::Debug`, using the former when
+    /// available. It does so by using a "specialization" hack: it has a blanket
+    /// DefaultDisplay trait impl for all types that are `fmt::Debug` and a
+    /// "specialized" inherent impl for all types that are `fmt::Display`.
+    ///
+    /// As long as `T: Display`, the "specialized" impl is what Rust will
+    /// resolve `DisplayHack(v).display()` to when `T: fmt::Display` as it is an
+    /// inherent impl. Otherwise, Rust will fall back to the blanket impl.
+    pub struct DisplayHack<T: ?Sized>(pub T);
 
-                panic!("aborting due to fairing failure(s)");
-            }
-            ErrorKind::Runtime(ref err) => {
-                error!("An error occurred in the runtime:");
-                info_!("{}", err);
-                panic!("aborting due to runtime failure");
-            }
-            ErrorKind::InsecureSecretKey(profile) => {
-                error!("secrets enabled in non-debug without `secret_key`");
-                info_!("selected profile: {}", Paint::default(profile).bold());
-                info_!("disable `secrets` feature or configure a `secret_key`");
-                panic!("aborting due to insecure configuration")
-            }
-            ErrorKind::Config(error) => {
-                crate::config::pretty_print_error(error.clone());
-                panic!("aborting due to invalid configuration")
-            }
-            ErrorKind::SentinelAborts(ref failures) => {
-                error!("Rocket failed to launch due to aborting sentinels:");
-                for sentry in failures {
-                    let name = Paint::default(sentry.type_name).bold();
-                    let (file, line, col) = sentry.location;
-                    info_!("{} ({}:{}:{})", name, file, line, col);
-                }
+    pub trait DefaultDisplay {
+        fn display(&self) -> impl fmt::Display;
+    }
 
-                panic!("aborting due to sentinel-triggered abort(s)");
-            }
+    /// Blanket implementation for `T: Debug`. This is what Rust will resolve
+    /// `DisplayHack<T>::display` to when `T: Debug`.
+    impl<T: fmt::Debug + ?Sized> DefaultDisplay for DisplayHack<T> {
+        #[inline(always)]
+        fn display(&self) -> impl fmt::Display {
+            Formatter(|f| fmt::Debug::fmt(&self.0, f))
+        }
+    }
+
+    /// "Specialized" implementation for `T: Display`. This is what Rust will
+    /// resolve `DisplayHack<T>::display` to when `T: Display`.
+    impl<T: fmt::Display + fmt::Debug + ?Sized> DisplayHack<T> {
+        #[inline(always)]
+        pub fn display(&self) -> impl fmt::Display + '_ {
+            Formatter(|f| fmt::Display::fmt(&self.0, f))
         }
     }
 }
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! display_hack {
+    ($v:expr) => ({
+        #[allow(unused_imports)]
+        use $crate::error::display_hack_impl::{DisplayHack, DefaultDisplay as _};
+
+        #[allow(unreachable_code)]
+        DisplayHack($v).display()
+    })
+}
+
+#[doc(hidden)]
+pub use display_hack as display_hack;

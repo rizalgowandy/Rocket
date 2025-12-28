@@ -1,5 +1,6 @@
 use std::fmt;
-use std::convert::TryInto;
+
+use rocket_http::HttpVersion;
 
 use crate::{Request, http::Method, local::asynchronous};
 use crate::http::uri::Origin;
@@ -22,8 +23,8 @@ use super::{Client, LocalResponse};
 /// let client = Client::tracked(rocket::build()).expect("valid rocket");
 /// let req = client.post("/")
 ///     .header(ContentType::JSON)
-///     .remote("127.0.0.1:8000".parse().unwrap())
-///     .cookie(Cookie::new("name", "value"))
+///     .remote("127.0.0.1:8000")
+///     .cookie(("name", "value"))
 ///     .body(r#"{ "value": 42 }"#);
 ///
 /// let response = req.dispatch();
@@ -41,6 +42,11 @@ impl<'c> LocalRequest<'c> {
     {
         let inner = asynchronous::LocalRequest::new(client.inner(), method, uri);
         Self { inner, client }
+    }
+
+    #[inline]
+    pub fn override_version(&mut self, version: HttpVersion) {
+        self.inner.override_version(version);
     }
 
     #[inline]

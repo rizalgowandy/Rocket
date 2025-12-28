@@ -1,10 +1,5 @@
-use std::collections::HashSet;
-
 use crate::{Rocket, Request, Response, Data, Build, Orbit};
 use crate::fairing::{Fairing, Info, Kind};
-use crate::log::PaintExt;
-
-use yansi::Paint;
 
 #[derive(Default)]
 pub struct Fairings {
@@ -19,18 +14,20 @@ pub struct Fairings {
     liftoff: Vec<usize>,
     request: Vec<usize>,
     response: Vec<usize>,
+    shutdown: Vec<usize>,
 }
 
 macro_rules! iter {
     ($_self:ident . $kind:ident) => ({
-        iter!($_self, $_self.$kind.iter()).map(|v| v.1)
+        iter!($_self, $_self.$kind.iter().copied()).map(|v| v.1)
     });
     ($_self:ident, $indices:expr) => ({
         let all_fairings = &$_self.all_fairings;
         $indices.filter_map(move |i| {
-            debug_assert!(all_fairings.get(*i).is_some());
-            let f = all_fairings.get(*i).map(|f| &**f)?;
-            Some((*i, f))
+            let i = i.clone();
+            debug_assert!(all_fairings.get(i).is_some());
+            let f = all_fairings.get(i).map(|f| &**f)?;
+            Some((i, f))
         })
     })
 }
@@ -46,6 +43,22 @@ impl Fairings {
             .chain(self.liftoff.iter())
             .chain(self.request.iter())
             .chain(self.response.iter())
+            .chain(self.shutdown.iter())
+    }
+
+    pub fn unique_active(&self) -> impl Iterator<Item = usize> {
+        let mut bitmap = vec![false; self.all_fairings.len()];
+        for i in self.active() {
+            bitmap.get_mut(*i).map(|active| *active = true);
+        }
+
+        bitmap.into_iter()
+            .enumerate()
+            .filter_map(|(i, active)| active.then_some(i))
+    }
+
+    pub fn unique_set(&self) -> Vec<&dyn Fairing> {
+        iter!(self, self.unique_active()).map(|v| v.1).collect()
     }
 
     pub fn add(&mut self, fairing: Box<dyn Fairing>) {
@@ -78,7 +91,7 @@ impl Fairings {
             };
 
             // Collect all of the active duplicates.
-            let mut dups: Vec<usize> = iter!(self, self.active())
+            let mut dups: Vec<usize> = iter!(self, self.unique_active())
                 .filter(|(_, f)| f.type_id() == this.type_id())
                 .map(|(i, _)| i)
                 .collect();
@@ -90,6 +103,7 @@ impl Fairings {
                 remove(i, &mut self.liftoff);
                 remove(i, &mut self.request);
                 remove(i, &mut self.response);
+                remove(i, &mut self.shutdown);
             }
         }
 
@@ -99,6 +113,7 @@ impl Fairings {
         if this_info.kind.is(Kind::Liftoff) { self.liftoff.push(index); }
         if this_info.kind.is(Kind::Request) { self.request.push(index); }
         if this_info.kind.is(Kind::Response) { self.response.push(index); }
+        if this_info.kind.is(Kind::Shutdown) { self.shutdown.push(index); }
     }
 
     pub fn append(&mut self, others: &mut Fairings) {
@@ -153,23 +168,38 @@ impl Fairings {
         }
     }
 
+    #[inline(always)]
+    pub async fn handle_shutdown(&self, rocket: &Rocket<Orbit>) {
+        let shutdown_futures = iter!(self.shutdown).map(|f| f.on_shutdown(rocket));
+        futures::future::join_all(shutdown_futures).await;
+    }
+
     pub fn audit(&self) -> Result<(), &[Info]> {
-        match self.failures.is_empty() {
-            true => Ok(()),
-            false => Err(&self.failures)
+        match &self.failures[..] {
+            [] => Ok(()),
+            failures => Err(failures)
         }
     }
 
-    pub fn pretty_print(&self) {
-        let active_fairings = self.active().collect::<HashSet<_>>();
-        if !active_fairings.is_empty() {
-            launch_info!("{}{}:", Paint::emoji("📡 "), Paint::magenta("Fairings"));
+    pub fn filter<F: Fairing>(&self) -> impl Iterator<Item = &F> {
+        iter!(self, self.unique_active())
+            .filter_map(|v| v.1.downcast_ref::<F>())
+    }
 
-            for (_, fairing) in iter!(self, active_fairings.into_iter()) {
-                launch_info_!("{} ({})", Paint::default(fairing.info().name).bold(),
-                Paint::blue(fairing.info().kind).bold());
-            }
+    pub fn filter_mut<F: Fairing>(&mut self) -> impl Iterator<Item = &mut F> {
+        let mut bitmap = vec![false; self.all_fairings.len()];
+        for &i in self.active() {
+            let is_target = self.all_fairings.get(i)
+                .and_then(|f| f.downcast_ref::<F>())
+                .is_some();
+
+            bitmap.get_mut(i).map(|target| *target = is_target);
         }
+
+        self.all_fairings.iter_mut()
+            .enumerate()
+            .filter(move |(i, _)| *bitmap.get(*i).unwrap_or(&false))
+            .filter_map(|(_, f)| f.downcast_mut::<F>())
     }
 }
 
@@ -184,6 +214,7 @@ impl std::fmt::Debug for Fairings {
             .field("liftoff", &debug_info(iter!(self.liftoff)))
             .field("request", &debug_info(iter!(self.request)))
             .field("response", &debug_info(iter!(self.response)))
+            .field("shutdown", &debug_info(iter!(self.shutdown)))
             .finish()
     }
 }

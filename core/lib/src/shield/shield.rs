@@ -1,14 +1,11 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use state::Storage;
-use yansi::Paint;
-
 use crate::{Rocket, Request, Response, Orbit, Config};
 use crate::fairing::{Fairing, Info, Kind};
 use crate::http::{Header, uncased::UncasedStr};
-use crate::log::PaintExt;
-use crate::shield::*;
+use crate::shield::{Frame, Hsts, NoSniff, Permission, Policy};
+use crate::trace::{Trace, TraceAll};
 
 /// A [`Fairing`] that injects browser security and privacy headers into all
 /// outgoing responses.
@@ -62,17 +59,22 @@ use crate::shield::*;
 ///
 /// If TLS is configured and enabled when the application is launched in a
 /// non-debug profile, HSTS is automatically enabled with its default policy and
-/// a warning is logged.
-///
-/// To get rid of this warning, explicitly [`Shield::enable()`] an [`Hsts`]
-/// policy.
+/// a warning is logged. To get rid of this warning, explicitly
+/// [`Shield::enable()`] an [`Hsts`] policy.
 pub struct Shield {
     /// Enabled policies where the key is the header name.
-    policies: HashMap<&'static UncasedStr, Box<dyn SubPolicy>>,
+    policies: HashMap<&'static UncasedStr, Header<'static>>,
     /// Whether to enforce HSTS even though the user didn't enable it.
     force_hsts: AtomicBool,
-    /// Headers pre-rendered at liftoff from the configured policies.
-    rendered: Storage<Vec<Header<'static>>>,
+}
+
+impl Clone for Shield {
+    fn clone(&self) -> Self {
+        Self {
+            policies: self.policies.clone(),
+            force_hsts: AtomicBool::from(self.force_hsts.load(Ordering::Acquire)),
+        }
+    }
 }
 
 impl Default for Shield {
@@ -111,13 +113,12 @@ impl Shield {
         Shield {
             policies: HashMap::new(),
             force_hsts: AtomicBool::new(false),
-            rendered: Storage::new(),
         }
     }
 
     /// Enables the policy header `policy`.
     ///
-    /// If the poliicy was previously enabled, the configuration is replaced
+    /// If the policy was previously enabled, the configuration is replaced
     /// with that of `policy`.
     ///
     /// # Example
@@ -129,8 +130,7 @@ impl Shield {
     /// let shield = Shield::new().enable(NoSniff::default());
     /// ```
     pub fn enable<P: Policy>(mut self, policy: P) -> Self {
-        self.rendered = Storage::new();
-        self.policies.insert(P::NAME.into(), Box::new(policy));
+        self.policies.insert(P::NAME.into(), policy.header());
         self
     }
 
@@ -145,7 +145,6 @@ impl Shield {
     /// let shield = Shield::default().disable::<NoSniff>();
     /// ```
     pub fn disable<P: Policy>(mut self) -> Self {
-        self.rendered = Storage::new();
         self.policies.remove(UncasedStr::new(P::NAME));
         self
     }
@@ -172,20 +171,6 @@ impl Shield {
     pub fn is_enabled<P: Policy>(&self) -> bool {
         self.policies.contains_key(UncasedStr::new(P::NAME))
     }
-
-    fn headers(&self) -> &[Header<'static>] {
-        self.rendered.get_or_set(|| {
-            let mut headers: Vec<_> = self.policies.values()
-                .map(|p| p.header())
-                .collect();
-
-            if self.force_hsts.load(Ordering::Acquire) {
-                headers.push(Policy::header(&Hsts::default()));
-            }
-
-            headers
-        })
-    }
 }
 
 #[crate::async_trait]
@@ -198,7 +183,11 @@ impl Fairing for Shield {
     }
 
     async fn on_liftoff(&self, rocket: &Rocket<Orbit>) {
-        let force_hsts = rocket.config().tls_enabled()
+        if self.policies.is_empty() {
+            return;
+        }
+
+        let force_hsts = rocket.endpoints().all(|v| v.is_tls())
             && rocket.figment().profile() != Config::DEBUG_PROFILE
             && !self.is_enabled::<Hsts>();
 
@@ -206,28 +195,26 @@ impl Fairing for Shield {
             self.force_hsts.store(true, Ordering::Release);
         }
 
-        if !self.headers().is_empty() {
-            info!("{}{}:", Paint::emoji("🛡️ "), Paint::magenta("Shield"));
-
-            for header in self.headers() {
-                info_!("{}: {}", header.name(), Paint::default(header.value()));
-            }
+        span_info!("shield", policies = self.policies.len() => {
+            self.policies.values().trace_all_info();
 
             if force_hsts {
-                warn_!("Detected TLS-enabled liftoff without enabling HSTS.");
-                warn_!("Shield has enabled a default HSTS policy.");
-                info_!("To remove this warning, configure an HSTS policy.");
+                warn!("Detected TLS-enabled liftoff without enabling HSTS.\n\
+                    Shield has enabled a default HSTS policy.\n\
+                    To remove this warning, configure an HSTS policy.");
             }
-        }
+        })
     }
 
     async fn on_response<'r>(&self, _: &'r Request<'_>, response: &mut Response<'r>) {
         // Set all of the headers in `self.policies` in `response` as long as
         // the header is not already in the response.
-        for header in self.headers() {
+        for header in self.policies.values() {
             if response.headers().contains(header.name()) {
-                warn!("Shield: response contains a '{}' header.", header.name());
-                warn_!("Refusing to overwrite existing header.");
+                span_warn!("shield", "shield refusing to overwrite existing response header" => {
+                    header.trace_warn();
+                });
+
                 continue
             }
 

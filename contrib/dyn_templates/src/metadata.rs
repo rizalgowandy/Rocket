@@ -1,8 +1,12 @@
-use rocket::{Request, Rocket, Ignite, Sentinel};
-use rocket::http::Status;
-use rocket::request::{self, FromRequest};
+use std::fmt;
+use std::borrow::Cow;
 
-use crate::context::ContextManager;
+use rocket::{Request, Rocket, Ignite, Sentinel};
+use rocket::http::{Status, ContentType};
+use rocket::request::{self, FromRequest};
+use rocket::serde::Serialize;
+
+use crate::{Template, context::ContextManager};
 
 /// Request guard for dynamically querying template metadata.
 ///
@@ -77,16 +81,65 @@ impl Metadata<'_> {
     pub fn reloading(&self) -> bool {
         self.0.is_reloading()
     }
+
+    /// Directly render the template named `name` with the context `context`
+    /// into a `String`. Also returns the template's detected `ContentType`. See
+    /// [`Template::render()`] for more details on rendering.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[macro_use] extern crate rocket;
+    /// use rocket::http::ContentType;
+    /// use rocket_dyn_templates::{Metadata, Template, context};
+    ///
+    /// #[get("/")]
+    /// fn send_email(metadata: Metadata) -> Option<()> {
+    ///     let (mime, string) = metadata.render("email", context! {
+    ///         field: "Hello, world!"
+    ///     })?;
+    ///
+    ///     # /*
+    ///     send_email(mime, string).await?;
+    ///     # */
+    ///     Some(())
+    /// }
+    ///
+    /// #[get("/")]
+    /// fn raw_render(metadata: Metadata) -> Option<(ContentType, String)> {
+    ///     metadata.render("index", context! { field: "Hello, world!" })
+    /// }
+    ///
+    /// // Prefer the following, however, which is nearly identical but pithier:
+    ///
+    /// #[get("/")]
+    /// fn render() -> Template {
+    ///     Template::render("index", context! { field: "Hello, world!" })
+    /// }
+    /// ```
+    pub fn render<S, C>(&self, name: S, context: C) -> Option<(ContentType, String)>
+        where S: Into<Cow<'static, str>>, C: Serialize
+    {
+        Template::render(name.into(), context).finalize(&self.0.context()).ok()
+    }
+}
+
+impl fmt::Debug for Metadata<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(&self.0.context().templates)
+            .finish()
+    }
 }
 
 impl Sentinel for Metadata<'_> {
     fn abort(rocket: &Rocket<Ignite>) -> bool {
         if rocket.state::<ContextManager>().is_none() {
-            let md = rocket::yansi::Paint::default("Metadata").bold();
-            let fairing = rocket::yansi::Paint::default("Template::fairing()").bold();
-            error!("requested `{}` guard without attaching `{}`.", md, fairing);
-            info_!("To use or query templates, you must attach `{}`.", fairing);
-            info_!("See the `Template` documentation for more information.");
+            error!(
+                "uninitialized template context: missing `Template::fairing()`.\n\
+                To use templates, you must attach `Template::fairing()`."
+            );
+
             return true;
         }
 
@@ -105,10 +158,12 @@ impl<'r> FromRequest<'r> for Metadata<'r> {
         request.rocket().state::<ContextManager>()
             .map(|cm| request::Outcome::Success(Metadata(cm)))
             .unwrap_or_else(|| {
-                error_!("Uninitialized template context: missing fairing.");
-                info_!("To use templates, you must attach `Template::fairing()`.");
-                info_!("See the `Template` documentation for more information.");
-                request::Outcome::Failure((Status::InternalServerError, ()))
+                error!(
+                    "uninitialized template context: missing `Template::fairing()`.\n\
+                    To use templates, you must attach `Template::fairing()`."
+                );
+
+                request::Outcome::Error((Status::InternalServerError, ()))
             })
     }
 }

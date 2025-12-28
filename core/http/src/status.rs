@@ -92,7 +92,27 @@ impl StatusClass {
 /// ```
 ///
 /// [`response::status`]: ../response/status/index.html
-#[derive(Debug, Clone, Copy)]
+///
+/// # (De)serialization
+///
+/// `Status` is both `Serialize` and `Deserialize`, represented as a `u16`. For
+/// example, [`Status::Ok`] (de)serializes from/to `200`. Any integer in the
+/// range `[100, 600)` is allowed to deserialize into a `Status`.`
+///
+/// ```rust
+/// # #[cfg(feature = "serde")] mod serde_impl {
+/// # use serde as serde;
+/// use serde::{Serialize, Deserialize};
+/// use rocket::http::Status;
+///
+/// #[derive(Deserialize, Serialize)]
+/// # #[serde(crate = "serde")]
+/// struct Foo {
+///     status: Status,
+/// }
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Status {
     /// The HTTP status code associated with this status.
     pub code: u16,
@@ -334,28 +354,48 @@ impl fmt::Display for Status {
     }
 }
 
-impl std::hash::Hash for Status {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.code.hash(state)
+#[cfg(feature = "serde")]
+mod serde_impl {
+    use super::*;
+
+    use serde::ser::{Serialize, Serializer};
+    use serde::de::{Deserialize, Deserializer, Error, Visitor, Unexpected};
+
+    impl Serialize for Status {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_u16(self.code)
+        }
     }
-}
 
-impl PartialEq for Status {
-    fn eq(&self, other: &Self) -> bool {
-        self.code.eq(&other.code)
+    struct DeVisitor;
+
+    impl<'de> Visitor<'de> for DeVisitor {
+        type Value = Status;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "HTTP status code integer in range [100, 600)")
+        }
+
+        fn visit_i64<E: Error>(self, v: i64) -> Result<Self::Value, E> {
+            if v < 100 || v >= 600 {
+                return Err(E::invalid_value(Unexpected::Signed(v), &self));
+            }
+
+            Ok(Status::new(v as u16))
+        }
+
+        fn visit_u64<E: Error>(self, v: u64) -> Result<Self::Value, E> {
+            if v < 100 || v >= 600 {
+                return Err(E::invalid_value(Unexpected::Unsigned(v), &self));
+            }
+
+            Ok(Status::new(v as u16))
+        }
     }
-}
 
-impl Eq for Status { }
-
-impl PartialOrd for Status {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.code.partial_cmp(&other.code)
-    }
-}
-
-impl Ord for Status {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.code.cmp(&other.code)
+    impl<'de> Deserialize<'de> for Status {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_u16(DeVisitor)
+        }
     }
 }

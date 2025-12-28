@@ -1,16 +1,28 @@
 #[cfg(all(feature = "diesel_sqlite_pool", feature = "diesel_postgres_pool"))]
 mod databases_tests {
-    use rocket_sync_db_pools::{database, diesel};
+    #![allow(dead_code)]
 
-    #[database("foo")]
-    struct TempStorage(diesel::SqliteConnection);
+    use rocket_sync_db_pools::database;
+
+    #[database("example")]
+    struct ExampleDb(diesel::SqliteConnection);
 
     #[database("bar")]
     struct PrimaryDb(diesel::PgConnection);
 }
 
-#[cfg(all(feature = "databases", feature = "sqlite_pool"))]
+#[cfg(feature = "memcache_pool")]
+mod memcache_pool_tests {
+    #![allow(dead_code)]
+
+    use rocket_sync_db_pools::database;
+
+    #[database("test_db")]
+    struct MemcacheDb(memcache::Client);
+}
+
 #[cfg(test)]
+#[cfg(all(feature = "sqlite_pool"))]
 mod rusqlite_integration_test {
     use rocket_sync_db_pools::{rusqlite, database};
 
@@ -56,13 +68,13 @@ mod rusqlite_integration_test {
 }
 
 #[cfg(test)]
-#[cfg(feature = "databases")]
 mod sentinel_and_runtime_test {
     use rocket::{Rocket, Build};
     use r2d2::{ManageConnection, Pool};
     use rocket_sync_db_pools::{database, Poolable, PoolResult};
     use tokio::runtime::Runtime;
 
+    #[allow(dead_code)]
     struct ContainsRuntime(Runtime);
     struct TestConnection;
 

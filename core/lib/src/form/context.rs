@@ -40,7 +40,7 @@ use crate::http::Status;
 /// `Context` serializes as a map, so it can be rendered in templates that
 /// require `Serialize` types. See the [forms guide] for further usage details.
 ///
-/// [forms guide]: https://rocket.rs/v0.5-rc/guide/requests/#context
+/// [forms guide]: https://rocket.rs/master/guide/requests/#context
 #[derive(Debug)]
 pub struct Contextual<'v, T> {
     /// The value, if it was successfully parsed, or `None` otherwise.
@@ -130,7 +130,7 @@ impl<'v> Context<'v> {
     /// }
     /// ```
     pub fn field_value<N: AsRef<Name>>(&self, name: N) -> Option<&'v str> {
-        self.values.get(name.as_ref())?.get(0).cloned()
+        self.values.get(name.as_ref())?.first().cloned()
     }
 
     /// Returns the values, if any, submitted for the _value_ field named
@@ -179,8 +179,7 @@ impl<'v> Context<'v> {
     /// ```
     pub fn errors(&self) -> impl Iterator<Item = &Error<'v>> {
         self.errors.values()
-            .map(|e| e.iter())
-            .flatten()
+            .flat_map(|e| e.iter())
             .chain(self.form_errors.iter())
     }
 
@@ -220,12 +219,11 @@ impl<'v> Context<'v> {
     ///     let foo_bar = form.context.field_errors("foo.bar");
     /// }
     /// ```
-    pub fn field_errors<'a, N>(&'a self, name: N) -> impl Iterator<Item = &Error<'v>> + '_
+    pub fn field_errors<'a, N>(&'a self, name: N) -> impl Iterator<Item = &'a Error<'v>> + 'a
         where N: AsRef<Name> + 'a
     {
         self.errors.values()
-            .map(|e| e.iter())
-            .flatten()
+            .flat_map(|e| e.iter())
             .filter(move |e| e.is_for(&name))
     }
 
@@ -247,7 +245,7 @@ impl<'v> Context<'v> {
     /// whose associated field name is _exactly_ `name` to be an error for the
     /// field named `name`. This is _not_ what is typically desired as it
     /// ignores errors that occur in the parent which will result in missing
-    /// errors associated with its chilren. Use [`Context::field_errors()`] in
+    /// errors associated with its children. Use [`Context::field_errors()`] in
     /// almost all cases.
     ///
     /// Lookup is case-sensitive but key-separator (`.` or `[]`) insensitive.
@@ -265,16 +263,15 @@ impl<'v> Context<'v> {
     ///     let id = form.context.exact_field_errors("id");
     ///
     ///     // Get all errors exactly for `foo.bar`. If `foo` failed, we will
-    ///     // this will return no erorrs. Use `Context::field_errors()`.
+    ///     // this will return no errors. Use `Context::field_errors()`.
     ///     let foo_bar = form.context.exact_field_errors("foo.bar");
     /// }
     /// ```
-    pub fn exact_field_errors<'a, N>(&'a self, name: N) -> impl Iterator<Item = &Error<'v>> + '_
+    pub fn exact_field_errors<'a, N>(&'a self, name: N) -> impl Iterator<Item = &'a Error<'v>> + 'a
         where N: AsRef<Name> + 'a
     {
         self.errors.values()
-            .map(|e| e.iter())
-            .flatten()
+            .flat_map(|e| e.iter())
             .filter(move |e| e.is_for_exactly(&name))
     }
 

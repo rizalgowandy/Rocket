@@ -97,24 +97,41 @@ macro_rules! pub_request_impl {
         self._request_mut().add_header(header.into());
     }
 
-    /// Set the remote address of this request.
+    /// Set the remote address of this request to `address`.
+    ///
+    /// `address` may be any type that [can be converted into a `Endpoint`].
+    /// If `address` fails to convert, the remote is left unchanged.
+    ///
+    /// [can be converted into a `Endpoint`]: crate::listener::Endpoint#conversions
     ///
     /// # Examples
     ///
     /// Set the remote address to "8.8.8.8:80":
     ///
     /// ```rust
+    /// use std::net::Ipv4Addr;
+    ///
     #[doc = $import]
     ///
     /// # Client::_test(|_, request, _| {
     /// let request: LocalRequest = request;
-    /// let address = "8.8.8.8:80".parse().unwrap();
-    /// let req = request.remote(address);
+    /// let req = request.remote("tcp:8.8.8.8:80");
+    ///
+    /// let remote = req.inner().remote().unwrap().tcp().unwrap();
+    /// assert_eq!(remote.ip(), Ipv4Addr::new(8, 8, 8, 8));
+    /// assert_eq!(remote.port(), 80);
     /// # });
     /// ```
     #[inline]
-    pub fn remote(mut self, address: std::net::SocketAddr) -> Self {
-        self.set_remote(address);
+    pub fn remote<T>(mut self, endpoint: T) -> Self
+        where T: TryInto<crate::listener::Endpoint>
+    {
+        if let Ok(endpoint) = endpoint.try_into() {
+            self.set_remote(endpoint);
+        } else {
+            warn!("remote failed to convert");
+        }
+
         self
     }
 
@@ -131,13 +148,15 @@ macro_rules! pub_request_impl {
     /// # Client::_test(|_, request, _| {
     /// let request: LocalRequest = request;
     /// let req = request
-    ///     .cookie(Cookie::new("username", "sb"))
-    ///     .cookie(Cookie::new("user_id", "12"));
+    ///     .cookie(("username", "sb"))
+    ///     .cookie(("user_id", "12"));
     /// # });
     /// ```
     #[inline]
-    pub fn cookie(mut self, cookie: crate::http::Cookie<'_>) -> Self {
-        self._request_mut().cookies_mut().add_original(cookie.into_owned());
+    pub fn cookie<'a, C>(mut self, cookie: C) -> Self
+        where C: Into<crate::http::Cookie<'a>>
+    {
+        self._request_mut().cookies_mut().add_original(cookie.into().into_owned());
         self
     }
 
@@ -151,15 +170,17 @@ macro_rules! pub_request_impl {
     ///
     /// # Client::_test(|_, request, _| {
     /// let request: LocalRequest = request;
-    /// let cookies = vec![Cookie::new("a", "b"), Cookie::new("c", "d")];
+    /// let cookies = vec![("a", "b"), ("c", "d")];
     /// let req = request.cookies(cookies);
     /// # });
     /// ```
     #[inline]
-    pub fn cookies<'a, C>(mut self, cookies: C) -> Self
-        where C: IntoIterator<Item = crate::http::Cookie<'a>>
+    pub fn cookies<'a, C, I>(mut self, cookies: I) -> Self
+        where C: Into<crate::http::Cookie<'a>>,
+              I: IntoIterator<Item = C>
     {
         for cookie in cookies {
+            let cookie: crate::http::Cookie<'_> = cookie.into();
             self._request_mut().cookies_mut().add_original(cookie.into_owned());
         }
 
@@ -180,19 +201,64 @@ macro_rules! pub_request_impl {
     ///
     /// # Client::_test(|_, request, _| {
     /// let request: LocalRequest = request;
-    /// let req = request.private_cookie(Cookie::new("user_id", "sb"));
+    /// let req = request.private_cookie(("user_id", "sb"));
     /// # });
     /// ```
     #[cfg(feature = "secrets")]
     #[cfg_attr(nightly, doc(cfg(feature = "secrets")))]
     #[inline]
-    pub fn private_cookie(mut self, cookie: crate::http::Cookie<'static>) -> Self {
-        self._request_mut().cookies_mut().add_original_private(cookie);
+    pub fn private_cookie<C>(mut self, cookie: C) -> Self
+        where C: Into<crate::http::Cookie<'static>>
+    {
+        self._request_mut().cookies_mut().add_original_private(cookie.into());
+        self
+    }
+
+    /// Set mTLS client certificates to send along with the request.
+    ///
+    /// If the request already contained certificates, they are replaced with
+    /// those in `reader.`
+    ///
+    /// `reader` is expected to be PEM-formatted and contain X509 certificates.
+    /// If it contains more than one certificate, the entire chain is set on the
+    /// request. If it contains items other than certificates, the certificate
+    /// chain up to the first non-certificate item is set on the request. If
+    /// `reader` is syntactically invalid PEM, certificates are cleared on the
+    /// request.
+    ///
+    /// The type `C` can be anything that implements [`std::io::Read`]. This
+    /// includes: `&[u8]`, `File`, `&File`, `Stdin`, and so on. To read a file
+    /// in at compile-time, use [`include_bytes!()`].
+    ///
+    /// ```rust
+    /// use std::fs::File;
+    ///
+    #[doc = $import]
+    /// use rocket::fs::relative;
+    ///
+    /// # Client::_test(|_, request, _| {
+    /// let request: LocalRequest = request;
+    /// let path = relative!("../../examples/tls/private/ed25519_cert.pem");
+    /// let req = request.identity(File::open(path).unwrap());
+    /// # });
+    /// ```
+    #[cfg(feature = "mtls")]
+    #[cfg_attr(nightly, doc(cfg(feature = "mtls")))]
+    pub fn identity<C: std::io::Read>(mut self, reader: C) -> Self {
+        use std::sync::Arc;
+        use crate::listener::Certificates;
+
+        let mut reader = std::io::BufReader::new(reader);
+        self._request_mut().connection.peer_certs = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map(|certs| Arc::new(Certificates::from(certs)))
+            .ok();
+
         self
     }
 
     /// Sets the body data of the request.
-    ///
+    ///core/lib/src/local/request.rs
     /// # Examples
     ///
     /// ```rust

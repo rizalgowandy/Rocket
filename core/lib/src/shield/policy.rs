@@ -4,10 +4,9 @@ use std::fmt;
 use std::borrow::Cow;
 
 use indexmap::IndexMap;
-use rocket_http::{ext::IntoCollection, private::SmallVec};
 use time::Duration;
 
-use crate::http::{Header, uri::Absolute, uncased::{UncasedStr, Uncased}};
+use crate::http::{Header, uri::Absolute, uncased::Uncased};
 
 /// Trait implemented by security and privacy policy headers.
 ///
@@ -62,22 +61,6 @@ pub trait Policy: Default + Send + Sync + 'static {
     /// }
     /// ```
     fn header(&self) -> Header<'static>;
-}
-
-/// Hack to make `Policy` Object-Safe.
-pub(crate) trait SubPolicy: Send + Sync {
-    fn name(&self) -> &'static UncasedStr;
-    fn header(&self) -> Header<'static>;
-}
-
-impl<P: Policy> SubPolicy for P {
-    fn name(&self) -> &'static UncasedStr {
-        P::NAME.into()
-    }
-
-    fn header(&self) -> Header<'static> {
-        Policy::header(self)
-    }
 }
 
 macro_rules! impl_policy {
@@ -176,10 +159,10 @@ impl From<&Referrer> for Header<'static> {
 /// The [Expect-CT] header: enables reporting and/or enforcement of [Certificate
 /// Transparency].
 ///
-/// [Certificate Transparency] can detect and prevent the use of misissued,
-/// malicious, or revoked TLS certificates. It solves a variety of problems with
-/// public TLS/SSL certificate management and is valuable measure for all public
-/// TLS applications.
+/// [Certificate Transparency] can detect and prevent the use of incorrectly
+/// issued malicious, or revoked TLS certificates. It solves a variety of
+/// problems with public TLS/SSL certificate management and is valuable measure
+/// for all public TLS applications.
 ///
 /// If you're just [getting started] with certificate transparency, ensure that
 /// your [site is in compliance][getting started] before you enable enforcement
@@ -426,17 +409,13 @@ impl From<&XssFilter> for Header<'static> {
 /// that you don't want to leak information to these domains.
 ///
 /// [X-DNS-Prefetch-Control]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-DNS-Prefetch-Control
+#[derive(Default)]
 pub enum Prefetch {
     /// Enables DNS prefetching. This is the browser default.
     On,
     /// Disables DNS prefetching. This is the shield policy default.
+    #[default]
     Off,
-}
-
-impl Default for Prefetch {
-    fn default() -> Prefetch {
-        Prefetch::Off
-    }
 }
 
 impl From<&Prefetch> for Header<'static> {
@@ -461,7 +440,7 @@ impl From<&Prefetch> for Header<'static> {
 /// control exactly _which_ (if any) origins may access or request access to
 /// browser features.
 ///
-/// Features are enabled via the [`Permission::allowed()`] contructor and
+/// Features are enabled via the [`Permission::allowed()`] constructor and
 /// chainable [`allow()`](Self::allow()) build method. Features can be blocked
 /// via the [`Permission::blocked()`] and chainable [`block()`](Self::block())
 /// builder method.
@@ -491,7 +470,7 @@ impl From<&Prefetch> for Header<'static> {
 ///
 /// [Permissions-Policy]: https://github.com/w3c/webappsec-permissions-policy/blob/a45df7b237e2a85e1909d7f226ca4eb4ce5095ba/permissions-policy-explainer.md
 #[derive(PartialEq, Clone)]
-pub struct Permission(IndexMap<Feature, Option<SmallVec<[Allow; 1]>>>);
+pub struct Permission(IndexMap<Feature, Vec<Allow>>);
 
 impl Default for Permission {
     /// The default `Permission` policy blocks access to the `interest-cohort`
@@ -530,7 +509,7 @@ impl Permission {
     /// let perm = Permission::allowed(Feature::Usb, [Allow::This, rocket]);
     /// ```
     pub fn allowed<L>(feature: Feature, allow: L) -> Self
-        where L: IntoCollection<Allow>
+        where L: IntoIterator<Item = Allow>
     {
         Permission(IndexMap::new()).allow(feature, allow)
     }
@@ -553,7 +532,7 @@ impl Permission {
     /// be a single [`Allow`], a slice (`[Allow]` or `&[Allow]`), or a vector
     /// (`Vec<Allow>`).
     ///
-    /// This policy supercedes any previous policy set for `feature`.
+    /// This policy supersedes any previous policy set for `feature`.
     ///
     /// If `allow` is empty, the use of the feature is blocked unless another
     /// call to `allow()` allows it. If `allow` contains [`Allow::Any`], the
@@ -576,14 +555,9 @@ impl Permission {
     ///     .allow(Feature::Payment, [rocket, Allow::This]);
     /// ```
     pub fn allow<L>(mut self, feature: Feature, allow: L) -> Self
-        where L: IntoCollection<Allow>
+        where L: IntoIterator<Item = Allow>
     {
-        let mut allow = allow.into_collection();
-
-        if allow.contains(&Allow::Any) {
-            allow = Allow::Any.into_collection();
-        }
-
+        let mut allow: Vec<_> = allow.into_iter().collect();
         for allow in &allow {
             if let Allow::Origin(absolute) = allow {
                 let auth = absolute.authority();
@@ -593,11 +567,15 @@ impl Permission {
             }
         }
 
-        self.0.insert(feature, Some(allow));
+        if allow.contains(&Allow::Any) {
+            allow = vec![Allow::Any];
+        }
+
+        self.0.insert(feature, allow);
         self
     }
 
-    /// Blocks `feature`. This policy supercedes any previous policy set for
+    /// Blocks `feature`. This policy supersedes any previous policy set for
     /// `feature`.
     ///
     /// # Example
@@ -610,7 +588,7 @@ impl Permission {
     ///     .block(Feature::Payment);
     /// ```
     pub fn block(mut self, feature: Feature) -> Self {
-        self.0.insert(feature, None);
+        self.0.insert(feature, vec![]);
         self
     }
 
@@ -628,11 +606,11 @@ impl Permission {
     /// assert_eq!(perm.get(Feature::Usb).unwrap(), &[Allow::Any]);
     /// ```
     pub fn get(&self, feature: Feature) -> Option<&[Allow]> {
-        self.0.get(&feature)?.as_deref()
+        Some(self.0.get(&feature)?)
     }
 
     /// Returns an iterator over the pairs of features and their allow lists,
-    /// `None` if the feature is blocked.
+    /// empty if the feature is blocked.
     ///
     /// Features are returned in the order in which they were first added.
     ///
@@ -651,13 +629,13 @@ impl Permission {
     /// let perms: Vec<_> = perm.iter().collect();
     /// assert_eq!(perms.len(), 3);
     /// assert_eq!(perms, vec![
-    ///     (Feature::Camera, Some(&[Allow::Any][..])),
-    ///     (Feature::Gyroscope, Some(&[Allow::This, Allow::Origin(foo)][..])),
-    ///     (Feature::Payment, None),
+    ///     (Feature::Camera, &[Allow::Any][..]),
+    ///     (Feature::Gyroscope, &[Allow::This, Allow::Origin(foo)][..]),
+    ///     (Feature::Payment, &[][..]),
     /// ]);
     /// ```
-    pub fn iter(&self) -> impl Iterator<Item = (Feature, Option<&[Allow]>)> {
-        self.0.iter().map(|(feature, list)| (*feature, list.as_deref()))
+    pub fn iter(&self) -> impl Iterator<Item = (Feature, &[Allow])> {
+        self.0.iter().map(|(feature, list)| (*feature, &**list))
     }
 }
 
@@ -674,9 +652,7 @@ impl From<&Permission> for Header<'static> {
 
         let value = perm.0.iter()
             .map(|(feature, allow)| {
-                let list = allow.as_ref()
-                    .into_iter()
-                    .flatten()
+                let list = allow.iter()
                     .map(|origin| origin.rendered())
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -737,6 +713,16 @@ impl Allow {
             Allow::Any => "*".into(),
             Allow::This => "self".into(),
         }
+    }
+}
+
+impl IntoIterator for Allow {
+    type Item = Self;
+
+    type IntoIter = std::iter::Once<Self>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        std::iter::once(self)
     }
 }
 

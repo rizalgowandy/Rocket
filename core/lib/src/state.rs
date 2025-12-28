@@ -63,6 +63,7 @@ use crate::http::Status;
 /// use rocket::State;
 /// use rocket::request::{self, Request, FromRequest};
 /// use rocket::outcome::IntoOutcome;
+/// use rocket::http::Status;
 ///
 /// # struct MyConfig { user_val: String };
 /// struct Item<'r>(&'r str);
@@ -79,7 +80,7 @@ use crate::http::Status;
 ///         // Or alternatively, using `Rocket::state()`:
 ///         let outcome = request.rocket().state::<MyConfig>()
 ///             .map(|my_config| Item(&my_config.user_val))
-///             .or_forward(());
+///             .or_forward(Status::InternalServerError);
 ///
 ///         outcome
 ///     }
@@ -199,8 +200,11 @@ impl<'r, T: Send + Sync + 'static> FromRequest<'r> for &'r State<T> {
         match State::get(req.rocket()) {
             Some(state) => Outcome::Success(state),
             None => {
-                error_!("Attempted to retrieve unmanaged state `{}`!", type_name::<T>());
-                Outcome::Failure((Status::InternalServerError, ()))
+            error!(type_name = type_name::<T>(),
+                "retrieving unmanaged state\n\
+                state must be managed via `rocket.manage()`");
+
+                Outcome::Error((Status::InternalServerError, ()))
             }
         }
     }
@@ -209,9 +213,10 @@ impl<'r, T: Send + Sync + 'static> FromRequest<'r> for &'r State<T> {
 impl<T: Send + Sync + 'static> Sentinel for &State<T> {
     fn abort(rocket: &Rocket<Ignite>) -> bool {
         if rocket.state::<T>().is_none() {
-            let type_name = yansi::Paint::default(type_name::<T>()).bold();
-            error!("launching with unmanaged `{}` state.", type_name);
-            info_!("Using `State` requires managing it with `.manage()`.");
+            error!(type_name = type_name::<T>(),
+                "unmanaged state detected\n\
+                ensure type is being managed via `rocket.manage()`");
+
             return true;
         }
 

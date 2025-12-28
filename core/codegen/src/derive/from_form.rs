@@ -4,10 +4,19 @@ use syn::parse::Parser;
 use devise::*;
 
 use crate::exports::*;
-use crate::derive::form_field::{*, FieldName::*};
+use crate::derive::form_field::FieldName::*;
+use crate::derive::form_field::{FieldExt, default, first_duplicate, validators};
 use crate::syn_ext::{GenericsExt as _, TypeExt as _};
 
 type WherePredicates = syn::punctuated::Punctuated<syn::WherePredicate, syn::Token![,]>;
+
+macro_rules! quote_spanned {
+    ($span:expr => $($token:tt)*) => (
+        quote::quote_spanned!(
+            proc_macro2::Span::call_site().located_at($span) => $($token)*
+        )
+    )
+}
 
 // F: fn(field_ty: Ty, field_context: Expr)
 fn fields_map<F>(fields: Fields<'_>, map_f: F) -> Result<TokenStream>
@@ -32,8 +41,8 @@ fn fields_map<F>(fields: Fields<'_>, map_f: F) -> Result<TokenStream>
         }
 
         matchers.extend(field.field_names()?.into_iter().map(|f| match f {
-            Cased(name) => quote!(#name => { #push }),
-            Uncased(name) => quote!(__n if __n.as_uncased() == #name => { #push }),
+            Cased(f) => quote_spanned!(ty.span() => #f => { #push }),
+            Uncased(f) => quote_spanned!(ty.span() => __n if __n.as_uncased() == #f => { #push }),
         }));
     }
 
@@ -73,7 +82,7 @@ fn context_type(input: Input<'_>) -> Result<(TokenStream, syn::Generics)> {
 
     let lifetime = syn::parse_quote!('r);
     if !gen.replace_lifetime(0, &lifetime) {
-        gen.insert_lifetime(syn::LifetimeDef::new(lifetime.clone()));
+        gen.insert_lifetime(syn::LifetimeParam::new(lifetime.clone()));
     }
 
     gen.add_where_predicates(generic_bounds(input)?);
@@ -120,10 +129,10 @@ pub fn derive_from_form(input: proc_macro::TokenStream) -> TokenStream {
                 let (ctxt_ty, gen) = context_type(input)?;
                 let (impl_gen, _, where_clause)  = gen.split_for_impl();
                 let output = mapper::input_default(mapper, input)?;
-                Ok(quote_spanned! { input.span() =>
+                Ok(quote_spanned! { mixed(input.span())=>
                     /// Rocket generated FormForm context.
                     #[doc(hidden)]
-                    #[allow(private_in_public)]
+                    #[allow(private_bounds)]
                     #vis struct #ctxt_ty #impl_gen #where_clause {
                         __opts: #_form::Options,
                         __errors: #_form::Errors<'r>,
@@ -148,6 +157,8 @@ pub fn derive_from_form(input: proc_macro::TokenStream) -> TokenStream {
             #[allow(unused_imports)]
             use #_http::uncased::AsUncased;
         })
+        .outer_mapper(quote!(#[allow(clippy::all, clippy::pedantic, clippy::nursery)]))
+        .outer_mapper(quote!(#[allow(renamed_and_removed_lints)]))
         .outer_mapper(quote!(#[allow(private_in_public)]))
         .outer_mapper(quote!(#[rocket::async_trait]))
         .inner_mapper(MapperBuild::new()
@@ -190,7 +201,7 @@ pub fn derive_from_form(input: proc_macro::TokenStream) -> TokenStream {
                 let (ctxt_ty, gen) = context_type(input)?;
                 let (_, ty_gen, _) = gen.split_for_impl();
                 let output = mapper::input_default(mapper, input)?;
-                Ok(quote! {
+                Ok(quote_spanned! { ctxt_ty.span() =>
                     async fn push_data(
                         __c: &mut #ctxt_ty #ty_gen,
                         __f: #_form::DataField<'r, '_>
@@ -202,10 +213,16 @@ pub fn derive_from_form(input: proc_macro::TokenStream) -> TokenStream {
             // Without the `let _fut`, we get a wild lifetime error. It don't
             // make no sense, Rust async/await: it don't make no sense.
             .try_fields_map(|_, f| fields_map(f, |ty, ctxt| quote_spanned!(ty.span() => {
-                let _fut = <#ty as #_form::FromForm<'r>>::push_data(#ctxt, __f.shift());
-                _fut.await;
+                let __fut = <#ty as #_form::FromForm<'r>>::push_data(#ctxt, __f.shift());
+                __fut.await;
             })))
         )
+        .inner_mapper(MapperBuild::new()
+            .with_output(|_, _| quote! {
+                fn push_error(__c: &mut Self::Context, __e: #_form::Error<'r>) {
+                    __c.__errors.push(__e);
+                }
+            }))
         .inner_mapper(MapperBuild::new()
             .with_output(|_, output| quote! {
                 fn finalize(mut __c: Self::Context) -> #_Result<Self, #_form::Errors<'r>> {
@@ -221,38 +238,25 @@ pub fn derive_from_form(input: proc_macro::TokenStream) -> TokenStream {
                     .map(|f| mapper.map_field(f))
                     .collect::<Result<Vec<TokenStream>>>()?;
 
-                let o = syn::Ident::new("__o", fields.span());
                 let (_ok, _some, _err, _none) = (_Ok, _Some, _Err, _None);
-                let validate = fields.iter().flat_map(|f| validators(f, &o, false).unwrap());
-                let name_buf_opt = fields.iter().map(|f| f.name_buf_opt().unwrap());
-
-                let ident: Vec<_> = fields.iter()
-                    .map(|f| f.context_ident())
-                    .collect();
-
+                let validator = fields.iter().flat_map(|f| validators(f).unwrap());
+                let ident = fields.iter().map(|f| f.context_ident());
                 let builder = fields.builder(|f| {
                     let ident = f.context_ident();
-                    quote!(#ident.unwrap())
+                    quote_spanned!(ident.span() => #ident.unwrap())
                 });
 
-                Ok(quote_spanned! { fields.span() =>
-                    #(let #ident = match #finalize_field {
-                        #_ok(#ident) => #_some(#ident),
-                        #_err(__e) => { __c.__errors.extend(__e); #_none }
-                    };)*
-
-                    if !__c.__errors.is_empty() {
-                        return #_Err(__c.__errors);
-                    }
-
-                    let #o = #builder;
+                Ok(quote_spanned!(fields.span() =>
+                    #(
+                        let #ident = match #finalize_field {
+                            #_ok(#ident) => #_some(#ident),
+                            #_err(__e) => { __c.__errors.extend(__e); #_none }
+                        };
+                    )*
 
                     #(
-                        if let #_err(__e) = #validate {
-                            __c.__errors.extend(match #name_buf_opt {
-                                Some(__name) => __e.with_name(__name),
-                                None => __e
-                            });
+                        if let #_err(__e) = #validator {
+                            __c.__errors.extend(__e);
                         }
                     )*
 
@@ -260,19 +264,17 @@ pub fn derive_from_form(input: proc_macro::TokenStream) -> TokenStream {
                         return #_Err(__c.__errors);
                     }
 
-                    Ok(#o)
-                })
+                    Ok(#builder)
+                ))
             })
             .try_field_map(|_, f| {
                 let (ident, ty) = (f.context_ident(), f.stripped_ty());
-                let validator = validators(f, &ident, true)?;
                 let name_buf_opt = f.name_buf_opt()?;
                 let default = default(f)?
                     .unwrap_or_else(|| quote_spanned!(ty.span() => {
                         <#ty as #_form::FromForm<'r>>::default(__opts)
                     }));
 
-                let _err = _Err;
                 Ok(quote_spanned! { ty.span() => {
                     let __opts = __c.__opts;
                     let __name = #name_buf_opt;
@@ -281,14 +283,9 @@ pub fn derive_from_form(input: proc_macro::TokenStream) -> TokenStream {
                             || #default.ok_or_else(|| #_form::ErrorKind::Missing.into()),
                             <#ty as #_form::FromForm<'r>>::finalize
                         )
-                        .and_then(|#ident| {
-                            let mut __es = #_form::Errors::new();
-                            #(if let #_err(__e) = #validator { __es.extend(__e); })*
-                            __es.is_empty().then(|| #ident).ok_or(__es)
-                        })
                         .map_err(|__e| match __name {
-                            Some(__name) => __e.with_name(__name),
-                            None => __e,
+                            #_Some(__name) => __e.with_name(__name),
+                            #_None => __e,
                         })
                         .map_err(|__e| __e.is_empty()
                             .then(|| #_form::ErrorKind::Unknown.into())

@@ -1,11 +1,11 @@
 #[macro_use] extern crate rocket;
 
-use rocket::http::{Cookie, CookieJar};
+use rocket::http::CookieJar;
 
 #[post("/")]
 fn multi_add(jar_a: &CookieJar<'_>, jar_b: &CookieJar<'_>) {
-    jar_a.add(Cookie::new("a", "v1"));
-    jar_b.add(Cookie::new("b", "v2"));
+    jar_a.add(("a", "v1"));
+    jar_b.add(("b", "v2"));
 }
 
 #[get("/")]
@@ -28,7 +28,7 @@ mod many_cookie_jars_tests {
     }
 
     #[test]
-    fn test_mutli_add() {
+    fn test_multi_add() {
         let client = Client::debug(rocket()).unwrap();
         let response = client.post("/").dispatch();
         let cookies = response.cookies();
@@ -38,11 +38,11 @@ mod many_cookie_jars_tests {
     }
 
     #[test]
-    fn test_mutli_get() {
+    fn test_multi_get() {
         let client = Client::debug(rocket()).unwrap();
         let response = client.get("/")
-            .cookie(Cookie::new("a", "a_val"))
-            .cookie(Cookie::new("b", "hi!"))
+            .cookie(("a", "a_val"))
+            .cookie(("b", "hi!"))
             .dispatch();
 
         assert_eq!(response.into_string().unwrap(), "a_valhi!");

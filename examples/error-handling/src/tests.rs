@@ -10,7 +10,7 @@ fn test_hello() {
     let response = client.get(uri).dispatch();
 
     assert_eq!(response.status(), Status::Ok);
-    assert_eq!(response.into_string().unwrap(), super::hello(name.into(), age));
+    assert_eq!(response.into_string().unwrap(), super::hello(name, age));
 }
 
 #[test]
@@ -46,7 +46,16 @@ fn forced_error() {
 fn test_hello_invalid_age() {
     let client = Client::tracked(super::rocket()).unwrap();
 
-    for path in &["Ford/-129", "Trillian/128", "foo/bar/baz"] {
+    for path in &["Ford/-129", "Trillian/128"] {
+        let request = client.get(format!("/hello/{}", path));
+        let expected = super::default_catcher(Status::UnprocessableEntity, request.inner());
+        let response = request.dispatch();
+        assert_eq!(response.status(), Status::UnprocessableEntity);
+        assert_eq!(response.into_string().unwrap(), expected.1);
+    }
+
+    {
+        let path = &"foo/bar/baz";
         let request = client.get(format!("/hello/{}", path));
         let expected = super::hello_not_found(request.inner());
         let response = request.dispatch();
@@ -59,7 +68,15 @@ fn test_hello_invalid_age() {
 fn test_hello_sergio() {
     let client = Client::tracked(super::rocket()).unwrap();
 
-    for path in &["oops", "-129", "foo/bar", "/foo/bar/baz"] {
+    for path in &["oops", "-129"] {
+        let request = client.get(format!("/hello/Sergio/{}", path));
+        let expected = super::sergio_error();
+        let response = request.dispatch();
+        assert_eq!(response.status(), Status::UnprocessableEntity);
+        assert_eq!(response.into_string().unwrap(), expected);
+    }
+
+    for path in &["foo/bar", "/foo/bar/baz"] {
         let request = client.get(format!("/hello/Sergio/{}", path));
         let expected = super::sergio_error();
         let response = request.dispatch();

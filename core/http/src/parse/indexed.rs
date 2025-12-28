@@ -36,7 +36,7 @@ impl AsPtr for [u8] {
 pub enum Indexed<'a, T: ?Sized + ToOwned> {
     /// The start and end index of a string.
     Indexed(usize, usize),
-    /// A conrete string.
+    /// A concrete string.
     Concrete(Cow<'a, T>)
 }
 
@@ -211,8 +211,8 @@ impl<'a, T: ?Sized + ToOwned + 'a> Indexed<'a, T>
         }
 
         match *self {
-            Indexed::Indexed(i, j) => &source.unwrap()[(i as usize)..(j as usize)],
-            Indexed::Concrete(ref mstr) => &*mstr,
+            Indexed::Indexed(i, j) => &source.unwrap()[i..j],
+            Indexed::Concrete(ref mstr) => mstr,
         }
     }
 }
@@ -241,7 +241,7 @@ impl<'a, T: ?Sized + Length + ToOwned + 'a> Length for Indexed<'a, T> {
     #[inline(always)]
     fn len(&self) -> usize {
         match *self {
-            Indexed::Indexed(a, b) => (b - a) as usize,
+            Indexed::Indexed(a, b) => b.saturating_sub(a),
             Indexed::Concrete(ref cow) => cow.len()
         }
     }

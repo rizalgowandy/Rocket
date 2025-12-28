@@ -1,4 +1,3 @@
-use crate::uri::{Origin, Authority, Absolute, Asterisk};
 use crate::parse::uri::*;
 
 macro_rules! assert_parse_eq {
@@ -8,7 +7,7 @@ macro_rules! assert_parse_eq {
             match from_str($from) {
                 Ok(output) => {
                     if output != expected {
-                        println!("Failure on: {:?}", $from);
+                        println!("Error on: {:?}", $from);
                         assert_eq!(output, expected, "{} != {}", output, expected);
                     }
                 }
@@ -53,7 +52,7 @@ macro_rules! assert_displays_eq {
                 Ok(output) => {
                     let output_string = output.to_string();
                     if output_string != string {
-                        println!("Failure on: {:?}", $string);
+                        println!("Error on: {:?}", $string);
                         println!("Got: {:?}", output_string);
                         println!("Parsed as: {:?}", output);
                         panic!("failed");
@@ -80,7 +79,7 @@ fn test_assert_parse_eq() {
 #[should_panic]
 fn test_assert_parse_eq_consecutive() {
     assert_parse_eq! {
-        "/" => Origin::ROOT,
+        "/" => Origin::root(),
         "/" => Asterisk
     };
 }
@@ -131,7 +130,7 @@ fn test_parse_issue_924_samples() {
 fn single_byte() {
     assert_parse_eq!(
         "*" => Asterisk,
-        "/" => Origin::ROOT,
+        "/" => Origin::root(),
         "." => Authority::new(None, ".", None),
         "_" => Authority::new(None, "_", None),
         "1" => Authority::new(None, "1", None),
@@ -139,11 +138,11 @@ fn single_byte() {
         "%" => Authority::new(None, "%", None),
         "?" => Reference::new(None, None, "", "", None),
         "#" => Reference::new(None, None, "", None, ""),
-        ":" => Authority::new(None, "", 0),
+        ":" => Authority::new(None, "", None),
         "@" => Authority::new("", "", None),
     );
 
-    assert_no_parse!("[", "]");
+    assert_no_parse!["\\", "^"];
 }
 
 #[test]
@@ -169,13 +168,13 @@ fn origin() {
 #[test]
 fn authority() {
     assert_parse_eq!(
-        "@:" => Authority::new("", "", 0),
+        "@:" => Authority::new("", "", None),
         "abc" => Authority::new(None, "abc", None),
         "@abc" => Authority::new("", "abc", None),
         "a@b" => Authority::new("a", "b", None),
         "a@" => Authority::new("a", "", None),
         ":@" => Authority::new(":", "", None),
-        ":@:" => Authority::new(":", "", 0),
+        ":@:" => Authority::new(":", "", None),
         "sergio:benitez@spark" => Authority::new("sergio:benitez", "spark", None),
         "a:b:c@1.2.3:12121" => Authority::new("a:b:c", "1.2.3", 12121),
         "sergio@spark" => Authority::new("sergio", "spark", None),
@@ -183,7 +182,7 @@ fn authority() {
         "sergio@[1::]:230" => Authority::new("sergio", "[1::]", 230),
         "rocket.rs:8000" => Authority::new(None, "rocket.rs", 8000),
         "[1::2::3]:80" => Authority::new(None, "[1::2::3]", 80),
-        "bar:" => Authority::new(None, "bar", 0), // could be absolute too
+        "bar:" => Authority::new(None, "bar", None), // could be absolute too
     );
 }
 
@@ -227,7 +226,7 @@ fn absolute() {
         "git://:@rocket.rs:443/abc?q" =>
             Absolute::new("git", Authority::new(":", "rocket.rs", 443), "/abc", "q"),
         "a://b?test" => Absolute::new("a", Authority::new(None, "b", None), "", "test"),
-        "a://b:?test" => Absolute::new("a", Authority::new(None, "b", 0), "", "test"),
+        "a://b:?test" => Absolute::new("a", Authority::new(None, "b", None), "", "test"),
         "a://b:1?test" => Absolute::new("a", Authority::new(None, "b", 1), "", "test"),
     };
 }
@@ -256,7 +255,7 @@ fn reference() {
         "a:/?a#b" => Reference::new("a", None, "/", "a", "b"),
         "a:?a#b" => Reference::new("a", None, "", "a", "b"),
         "a://?a#b" => Reference::new("a", Authority::new(None, "", None), "", "a", "b"),
-        "a://:?a#b" => Reference::new("a", Authority::new(None, "", 0), "", "a", "b"),
+        "a://:?a#b" => Reference::new("a", Authority::new(None, "", None), "", "a", "b"),
         "a://:2000?a#b" => Reference::new("a", Authority::new(None, "", 2000), "", "a", "b"),
         "a://a:2000?a#b" => Reference::new("a", Authority::new(None, "a", 2000), "", "a", "b"),
         "a://a:@2000?a#b" => Reference::new("a", Authority::new("a:", "2000", None), "", "a", "b"),

@@ -39,6 +39,10 @@ use {std::time::Duration, crate::{Error, Config}};
 ///     async fn get(&self) -> Result<Self::Connection, Self::Error> {
 ///         todo!("fetch one connection from the pool");
 ///     }
+///
+///     async fn close(&self) {
+///         todo!("gracefully shutdown connection pool");
+///     }
 /// }
 /// ```
 ///
@@ -76,6 +80,8 @@ use {std::time::Duration, crate::{Error, Config}};
 /// #    fn acquire(&self) -> Result<Connection, GetError> {
 /// #        Ok(())
 /// #    }
+/// #
+/// #   async fn shutdown(&self) { }
 /// # }
 ///
 /// #[rocket::async_trait]
@@ -92,7 +98,7 @@ use {std::time::Duration, crate::{Error, Config}};
 ///         // `InitError` to `Error<InitError, _>` with `Error::Init`.
 ///         let pool = MyPool::new(config).map_err(Error::Init)?;
 ///
-///         // Return the fully intialized pool.
+///         // Return the fully initialized pool.
 ///         Ok(pool)
 ///     }
 ///
@@ -101,10 +107,14 @@ use {std::time::Duration, crate::{Error, Config}};
 ///         // Map errors of type `GetError` to `Error<_, GetError>`.
 ///         self.acquire().map_err(Error::Get)
 ///     }
+///
+///     async fn close(&self) {
+///         self.shutdown().await;
+///     }
 /// }
 /// ```
 #[rocket::async_trait]
-pub trait Pool: Sized + Send + Sync + 'static {
+pub trait Pool: Sized + Send + 'static {
     /// The connection type managed by this pool, returned by [`Self::get()`].
     type Connection;
 
@@ -133,14 +143,24 @@ pub trait Pool: Sized + Send + Sync + 'static {
     /// such as a preconfigured timeout elapsing or when the database server is
     /// unavailable.
     async fn get(&self) -> Result<Self::Connection, Self::Error>;
+
+    /// Shutdown the connection pool, disallowing any new connections from being
+    /// retrieved and waking up any tasks with active connections.
+    ///
+    /// The returned future may either resolve when all connections are known to
+    /// have closed or at any point prior. Details are implementation specific.
+    async fn close(&self);
 }
 
 #[cfg(feature = "deadpool")]
 mod deadpool_postgres {
-    use deadpool::{managed::{Manager, Pool, PoolError, Object, BuildError}, Runtime};
+    use deadpool::{Runtime, managed::{Manager, Pool, PoolError, Object}};
     use super::{Duration, Error, Config, Figment};
 
-    pub trait DeadManager: Manager + Sized + Send + Sync + 'static {
+    #[cfg(feature = "diesel")]
+    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+
+    pub trait DeadManager: Manager + Sized + Send + 'static {
         fn new(config: &Config) -> Result<Self, Self::Error>;
     }
 
@@ -158,17 +178,31 @@ mod deadpool_postgres {
         }
     }
 
+    #[cfg(feature = "diesel_postgres")]
+    impl DeadManager for AsyncDieselConnectionManager<diesel_async::AsyncPgConnection> {
+        fn new(config: &Config) -> Result<Self, Self::Error> {
+            Ok(Self::new(config.url.as_str()))
+        }
+    }
+
+    #[cfg(feature = "diesel_mysql")]
+    impl DeadManager for AsyncDieselConnectionManager<diesel_async::AsyncMysqlConnection> {
+        fn new(config: &Config) -> Result<Self, Self::Error> {
+            Ok(Self::new(config.url.as_str()))
+        }
+    }
+
     #[rocket::async_trait]
     impl<M: DeadManager, C: From<Object<M>>> crate::Pool for Pool<M, C>
-        where M::Type: Send, C: Send + Sync + 'static, M::Error: std::error::Error
+        where M::Type: Send, C: Send + 'static, M::Error: std::error::Error
     {
-        type Error = Error<BuildError<M::Error>, PoolError<M::Error>>;
+        type Error = Error<PoolError<M::Error>>;
 
         type Connection = C;
 
         async fn init(figment: &Figment) -> Result<Self, Self::Error> {
             let config: Config = figment.extract()?;
-            let manager = M::new(&config).map_err(|e| Error::Init(BuildError::Backend(e)))?;
+            let manager = M::new(&config).map_err(|e| Error::Init(e.into()))?;
 
             Pool::builder(manager)
                 .max_size(config.max_connections)
@@ -177,11 +211,15 @@ mod deadpool_postgres {
                 .recycle_timeout(config.idle_timeout.map(Duration::from_secs))
                 .runtime(Runtime::Tokio1)
                 .build()
-                .map_err(Error::Init)
+                .map_err(|_| Error::Init(PoolError::NoRuntimeSpecified))
         }
 
         async fn get(&self) -> Result<Self::Connection, Self::Error> {
             self.get().await.map_err(Error::Get)
+        }
+
+        async fn close(&self) {
+            <Pool<M, C>>::close(self)
         }
     }
 }
@@ -190,7 +228,7 @@ mod deadpool_postgres {
 mod sqlx {
     use sqlx::ConnectOptions;
     use super::{Duration, Error, Config, Figment};
-    use rocket::config::LogLevel;
+    use rocket::tracing::level_filters::LevelFilter;
 
     type Options<D> = <<D as sqlx::Database>::Connection as sqlx::Connection>::Options;
 
@@ -201,6 +239,12 @@ mod sqlx {
             *o = std::mem::take(o)
                 .busy_timeout(Duration::from_secs(__config.connect_timeout))
                 .create_if_missing(true);
+
+            if let Some(ref exts) = __config.extensions {
+                for ext in exts {
+                    *o = std::mem::take(o).extension(ext.clone());
+                }
+            }
         }
     }
 
@@ -215,26 +259,37 @@ mod sqlx {
             let mut opts = config.url.parse::<Options<D>>().map_err(Error::Init)?;
             specialize(&mut opts, &config);
 
-            opts.disable_statement_logging();
-            if let Ok(level) = figment.extract_inner::<LogLevel>(rocket::Config::LOG_LEVEL) {
-                if !matches!(level, LogLevel::Normal | LogLevel::Off) {
-                    opts.log_statements(level.into())
-                        .log_slow_statements(level.into(), Duration::default());
+            opts = opts.disable_statement_logging();
+            if let Ok(value) = figment.find_value(rocket::Config::LOG_LEVEL) {
+                if let Some(level) = value.as_str().and_then(|v| v.parse().ok()) {
+                    let log_level = match level {
+                        LevelFilter::OFF => log::LevelFilter::Off,
+                        LevelFilter::ERROR => log::LevelFilter::Error,
+                        LevelFilter::WARN => log::LevelFilter::Warn,
+                        LevelFilter::INFO => log::LevelFilter::Info,
+                        LevelFilter::DEBUG => log::LevelFilter::Debug,
+                        LevelFilter::TRACE => log::LevelFilter::Trace,
+                    };
+
+                    opts = opts.log_statements(log_level)
+                        .log_slow_statements(log_level, Duration::default());
                 }
             }
 
-            sqlx::pool::PoolOptions::new()
+            Ok(sqlx::pool::PoolOptions::new()
                 .max_connections(config.max_connections as u32)
-                .connect_timeout(Duration::from_secs(config.connect_timeout))
+                .acquire_timeout(Duration::from_secs(config.connect_timeout))
                 .idle_timeout(config.idle_timeout.map(Duration::from_secs))
                 .min_connections(config.min_connections.unwrap_or_default())
-                .connect_with(opts)
-                .await
-                .map_err(Error::Init)
+                .connect_lazy_with(opts))
         }
 
         async fn get(&self) -> Result<Self::Connection, Self::Error> {
             self.acquire().await.map_err(Error::Get)
+        }
+
+        async fn close(&self) {
+            <sqlx::Pool<D>>::close(self).await;
         }
     }
 }
@@ -263,6 +318,10 @@ mod mongodb {
 
         async fn get(&self) -> Result<Self::Connection, Self::Error> {
             Ok(self.clone())
+        }
+
+        async fn close(&self) {
+            // nothing to do for mongodb
         }
     }
 }

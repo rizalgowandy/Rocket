@@ -1,5 +1,4 @@
 use std::fmt::{self, Display};
-use std::convert::TryFrom;
 use std::borrow::Cow;
 
 use crate::ext::IntoOwned;
@@ -12,7 +11,7 @@ use crate::uri::error::{Error, TryFromUriError};
 ///
 /// In Rocket, this type will rarely be used directly. Instead, you will
 /// typically encounter URIs via the [`Origin`] type. This is because all
-/// incoming requests accepred by Rocket contain URIs in origin-form.
+/// incoming requests accepted by Rocket contain URIs in origin-form.
 ///
 /// ## Parsing
 ///
@@ -56,7 +55,7 @@ impl<'a> Uri<'a> {
     /// [`Absolute`], or [`Reference`]. Parsing never allocates. Returns an
     /// `Error` if `string` is not a valid URI of kind `T`.
     ///
-    /// To perform an ambgiuous parse into _any_ valid URI type, use
+    /// To perform an ambiguous parse into _any_ valid URI type, use
     /// [`Uri::parse_any()`].
     ///
     /// # Example
@@ -80,7 +79,7 @@ impl<'a> Uri<'a> {
     /// // Invalid URIs fail to parse.
     /// Uri::parse::<Origin>("foo bar").expect_err("invalid URI");
     /// ```
-    pub fn parse<T>(string: &'a str) -> Result<Uri<'a>, Error<'_>>
+    pub fn parse<T>(string: &'a str) -> Result<Uri<'a>, Error<'a>>
         where T: Into<Uri<'a>> + TryFrom<&'a str, Error = Error<'a>>
     {
         T::try_from(string).map(|v| v.into())
@@ -90,7 +89,7 @@ impl<'a> Uri<'a> {
     ///
     /// Always prefer to use `uri!()` for statically known inputs.
     ///
-    /// Because URI parsing is ambgious (that is, there isn't a one-to-one
+    /// Because URI parsing is ambiguous (that is, there isn't a one-to-one
     /// mapping between strings and a URI type), the internal type returned by
     /// this method _may_ not be the desired type. This method chooses the "best
     /// fit" type for a given string by preferring to parse in the following
@@ -128,7 +127,7 @@ impl<'a> Uri<'a> {
     /// let uri: Origin = uri!("/a/b/c?query");
     /// let uri: Reference = uri!("/a/b/c?query#fragment");
     /// ```
-    pub fn parse_any(string: &'a str) -> Result<Uri<'a>, Error<'_>> {
+    pub fn parse_any(string: &'a str) -> Result<Uri<'a>, Error<'a>> {
         crate::parse::uri::from_str(string)
     }
 
@@ -335,6 +334,24 @@ macro_rules! impl_uri_from {
                 }
             }
         }
+
+        impl<'b, $($lt)?> PartialEq<&$T $(<$lt>)?> for Uri<'b> {
+            fn eq(&self, other: &&$T $(<$lt>)?) -> bool {
+                match self {
+                    Uri::$T(inner) => inner == *other,
+                    _ => false
+                }
+            }
+        }
+
+        impl<'b, $($lt)?> PartialEq<Uri<'b>> for &$T $(<$lt>)? {
+            fn eq(&self, other: &Uri<'b>) -> bool {
+                match other {
+                    Uri::$T(inner) => inner == *self,
+                    _ => false
+                }
+            }
+        }
     )
 }
 
@@ -348,13 +365,13 @@ impl_uri_from!(Asterisk);
 macro_rules! impl_serde {
     ($T:ty, $expected:literal) => {
         #[cfg(feature = "serde")]
-        mod serde {
+        mod serde_impl {
             use std::fmt;
             use std::marker::PhantomData;
             use super::*;
 
-            use serde_::ser::{Serialize, Serializer};
-            use serde_::de::{Deserialize, Deserializer, Error, Visitor};
+            use serde::ser::{Serialize, Serializer};
+            use serde::de::{Deserialize, Deserializer, Error, Visitor};
 
             impl<'a> Serialize for $T {
                 fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -392,7 +409,10 @@ macro_rules! impl_serde {
 /// Implements traits from `impl_base_traits` and IntoOwned for a URI.
 macro_rules! impl_traits {
     ($T:ident, $($field:ident),* $(,)?) => {
-        impl_base_traits!($T, $($field),*);
+        impl_traits!($T [parse], $($field),*);
+    };
+    ($T:ident [$partial_eq_parse:ident], $($field:ident),* $(,)?) => {
+        impl_base_traits!($T [$partial_eq_parse], $($field),*);
 
         impl crate::ext::IntoOwned for $T<'_> {
             type Owned = $T<'static>;
@@ -410,6 +430,9 @@ macro_rules! impl_traits {
 /// Implements PartialEq, Eq, Hash, and TryFrom.
 macro_rules! impl_base_traits {
     ($T:ident, $($field:ident),* $(,)?) => {
+        impl_base_traits!($T [parse], $($field),*);
+    };
+    ($T:ident [$partial_eq_parse:ident], $($field:ident),* $(,)?) => {
         impl std::convert::TryFrom<String> for $T<'static> {
             type Error = Error<'static>;
 
@@ -443,7 +466,7 @@ macro_rules! impl_base_traits {
 
         impl PartialEq<str> for $T<'_> {
             fn eq(&self, string: &str) -> bool {
-                $T::parse(string).map_or(false, |v| &v == self)
+                $T::$partial_eq_parse(string).map_or(false, |v| &v == self)
             }
         }
 
@@ -466,5 +489,37 @@ macro_rules! impl_base_traits {
                 $(self.$field().hash(state);)*
             }
         }
+    }
+}
+
+mod tests {
+    #[test]
+    fn normalization() {
+        fn normalize(uri: &str) -> String {
+            use crate::uri::Uri;
+
+            match Uri::parse_any(uri).unwrap() {
+                Uri::Origin(uri) => uri.into_normalized().to_string(),
+                Uri::Absolute(uri) => uri.into_normalized().to_string(),
+                Uri::Reference(uri) => uri.into_normalized().to_string(),
+                uri => uri.to_string(),
+            }
+        }
+
+        assert_eq!(normalize("/#"), "/#");
+
+        assert_eq!(normalize("/"), "/");
+        assert_eq!(normalize("//"), "/");
+        assert_eq!(normalize("//////a/"), "/a/");
+        assert_eq!(normalize("//ab"), "/ab");
+        assert_eq!(normalize("//a"), "/a");
+        assert_eq!(normalize("/a/b///c"), "/a/b/c");
+        assert_eq!(normalize("/a/b///c/"), "/a/b/c/");
+        assert_eq!(normalize("/a///b/c/d///"), "/a/b/c/d/");
+
+        assert_eq!(normalize("/?"), "/?");
+        assert_eq!(normalize("/?foo"), "/?foo");
+        assert_eq!(normalize("/a/?"), "/a/?");
+        assert_eq!(normalize("/a/?foo"), "/a/?foo");
     }
 }

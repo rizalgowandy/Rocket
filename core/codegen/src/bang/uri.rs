@@ -23,7 +23,7 @@ macro_rules! p {
 }
 
 pub fn prefix_last_segment(path: &mut syn::Path, prefix: &str) {
-    let mut last_seg = path.segments.last_mut().expect("syn::Path has segments");
+    let last_seg = path.segments.last_mut().expect("syn::Path has segments");
     last_seg.ident = last_seg.ident.prepend(prefix);
 }
 
@@ -61,14 +61,14 @@ fn extract_exprs(internal: &InternalUriParams) -> Result<(
             let types = internal.fn_args.iter().map(|a| (&a.ident, &a.ty));
             Ok((path_exprs, query_exprs, types))
         }
-        Validation::NamedIgnored(_) => {
+        Validation::NamedIgnored(args) => {
             let mut route_name = quote!(#route_name).to_string();
             route_name.retain(|c| !c.is_whitespace());
 
             let diag = internal.uri_mac.args_span()
                 .error("expected unnamed arguments due to ignored parameters")
-                .note(format!("uri for route `{}` ignores path parameters: \"{}\"",
-                        route_name, internal.route_uri));
+                .note(format!("uri for route `{}` ignores {} path parameters: \"{}\"",
+                        route_name, args.len(), internal.route_uri));
 
             Err(diag)
         }
@@ -126,7 +126,7 @@ fn add_binding<P: fmt::Part>(to: &mut Vec<TokenStream>, ident: &Ident, ty: &Type
     let tmp_ident = ident.clone().with_span(expr.span());
     let let_stmt = quote_spanned!(span => let #tmp_ident = #expr);
 
-    to.push(quote_spanned!(span =>
+    to.push(quote_spanned!(mixed(span) =>
         #[allow(non_snake_case)] #let_stmt;
         let #ident = <#ty as #_fmt::FromUriParam<#part, _>>::from_uri_param(#tmp_ident);
     ));
@@ -151,7 +151,7 @@ fn explode_path<'a>(
                 Parameter::Dynamic(_) | Parameter::Guard(_) => {
                     let (ident, ty) = args.next().expect("ident/ty for non-ignored");
                     let expr = exprs.next().expect("one expr per dynamic arg");
-                    add_binding::<fmt::Path>(bindings, &ident, &ty, &expr);
+                    add_binding::<fmt::Path>(bindings, ident, ty, expr);
                     quote_spanned!(expr.span() => &#ident as &dyn #uri_display)
                 }
                 Parameter::Ignored(_) => {
@@ -207,7 +207,7 @@ fn explode_query<'a>(
         };
 
         let name = &dynamic.name;
-        add_binding::<fmt::Query>(bindings, &ident, &ty, &expr);
+        add_binding::<fmt::Query>(bindings, ident, ty, expr);
         Some(match dynamic.trailing {
             false => quote_spanned! { expr.span() =>
                 #query_arg::NameValue(#name, &#ident as &dyn #uri_display)

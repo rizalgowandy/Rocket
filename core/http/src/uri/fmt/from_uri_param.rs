@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap};
+
+use either::Either;
 
 use crate::uri::fmt::UriDisplay;
 use crate::uri::fmt::{self, Part};
@@ -16,15 +18,16 @@ use crate::uri::fmt::{self, Part};
 ///
 /// In the rare case that `UriDisplay` is implemented manually, this trait, too,
 /// must be implemented explicitly. In the majority of cases, implementation can
-/// be automated. Rocket provides [`impl_from_uri_param_identity`] to generate
+/// be automated. Rocket provides [`impl_from_uri_param_identity!`] to generate
 /// the _identity_ implementations automatically. For a type `T`, these are:
 ///
 ///   * `impl<P: Part> FromUriParam<P, T> for T`
 ///   * `impl<'x, P: Part> FromUriParam<P, &'x T> for T`
 ///   * `impl<'x, P: Part> FromUriParam<P, &'x mut T> for T`
 ///
-/// See [`impl_from_uri_param_identity!`](crate::impl_from_uri_param_identity!)
-/// for usage details.
+/// See [`impl_from_uri_param_identity!`] for usage details.
+///
+/// [`impl_from_uri_param_identity!`]: crate::impl_from_uri_param_identity!
 ///
 /// # Code Generation
 ///
@@ -60,7 +63,7 @@ use crate::uri::fmt::{self, Part};
 ///
 ///    * `String`, `i8`, `i16`, `i32`, `i64`, `i128`, `isize`, `u8`, `u16`,
 ///      `u32`, `u64`, `u128`, `usize`, `f32`, `f64`, `bool`, `IpAddr`,
-///      `Ipv4Addr`, `Ipv6Addr`, `&str`, `Cow<str>`
+///      `Ipv4Addr`, `Ipv6Addr`, `&str`, `Cow<str>`, `Either<A, B>`
 ///
 /// The following types have _identity_ implementations _only in [`Path`]_:
 ///
@@ -178,7 +181,7 @@ use crate::uri::fmt::{self, Part};
 /// assert_eq!(uri.query().unwrap(), "name=Robert%20Mike&nickname=Bob");
 /// ```
 ///
-/// [`uri!`]: rocket::uri
+/// [`uri!`]: ../../../../rocket/macro.uri.html
 /// [`FromUriParam::Target`]: crate::uri::fmt::FromUriParam::Target
 /// [`Path`]: crate::uri::fmt::Path
 /// [`Query`]: crate::uri::fmt::Query
@@ -316,7 +319,31 @@ impl_from_uri_param_identity!([fmt::Path] PathBuf);
 
 impl_conversion_ref! {
     [fmt::Path] ('a) &'a Path => PathBuf,
-    [fmt::Path] ('a) PathBuf => &'a Path
+    [fmt::Path] ('a) PathBuf => &'a Path,
+}
+
+// TODO: A specialized `RawBytes` instead of `&[u8]`. Then impl [T] => Vec<T>.
+impl_from_uri_param_identity!([fmt::Query] ('a) &'a [u8]);
+
+impl_conversion_ref! {
+    [fmt::Query] (T, A: FromUriParam<fmt::Query, T> + UriDisplay<fmt::Query>) Vec<A> => Vec<T>,
+    [fmt::Query] (
+            T,
+            A: FromUriParam<fmt::Query, T> + UriDisplay<fmt::Query>,
+            const N: usize
+        ) Vec<A> => [T; N],
+
+    [fmt::Query] (
+            T,
+            A: FromUriParam<fmt::Query, T> + UriDisplay<fmt::Query>,
+            const N: usize
+        ) [A; N] => Vec<T>,
+
+    [fmt::Query] (
+            T,
+            A: FromUriParam<fmt::Query, T> + UriDisplay<fmt::Query>,
+            const N: usize
+        ) [A; N] => [T; N],
 }
 
 /// A no cost conversion allowing an `&str` to be used in place of a `PathBuf`.
@@ -350,12 +377,27 @@ impl<A, T: FromUriParam<fmt::Path, A>> FromUriParam<fmt::Path, A> for Option<T> 
 }
 
 /// A no cost conversion allowing `T` to be used in place of an `Result<T, E>`.
-impl<A, E, T: FromUriParam<fmt::Path, A>> FromUriParam<fmt::Path, A> for Result<T, E> {
+impl<A, E, T> FromUriParam<fmt::Path, A> for Result<T, E>
+    where T: FromUriParam<fmt::Path, A>
+{
     type Target = T::Target;
 
     #[inline(always)]
     fn from_uri_param(param: A) -> Self::Target {
         T::from_uri_param(param)
+    }
+}
+
+impl<P: Part, A, B, T, U> FromUriParam<P, Either<A, B>> for Either<T, U>
+    where T: FromUriParam<P, A>, U: FromUriParam<P, B>
+{
+    type Target = Either<T::Target, U::Target>;
+
+    fn from_uri_param(param: Either<A, B>) -> Self::Target {
+        match param {
+            Either::Left(a) => Either::Left(T::from_uri_param(a)),
+            Either::Right(b) => Either::Right(U::from_uri_param(b)),
+        }
     }
 }
 

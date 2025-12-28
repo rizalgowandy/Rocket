@@ -1,13 +1,11 @@
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 
-use rocket::{error, info_, Build, Ignite, Phase, Rocket, Sentinel};
+use rocket::{error, Build, Ignite, Phase, Rocket, Sentinel, Orbit};
 use rocket::fairing::{self, Fairing, Info, Kind};
 use rocket::request::{FromRequest, Outcome, Request};
-use rocket::http::Status;
-
-use rocket::yansi::Paint;
 use rocket::figment::providers::Serialized;
+use rocket::http::Status;
 
 use crate::Pool;
 
@@ -122,10 +120,10 @@ pub trait Database: From<Self::Pool> + DerefMut<Target = Self::Pool> + Send + Sy
             return Some(db);
         }
 
-        let dbtype = std::any::type_name::<Self>();
-        let fairing = Paint::default(format!("{}::init()", dbtype)).bold();
-        error!("Attempted to fetch unattached database `{}`.", Paint::default(dbtype).bold());
-        info_!("`{}` fairing must be attached prior to using this database.", fairing);
+        let conn = std::any::type_name::<Self>();
+        error!("`{conn}::init()` is not attached\n\
+            the fairing must be attached to use `{conn}` in routes.");
+
         None
     }
 }
@@ -164,9 +162,9 @@ pub struct Initializer<D: Database>(Option<&'static str>, PhantomData<fn() -> D>
 /// [`connect_timeout`](crate::Config::connect_timeout) seconds.
 ///   * If the `Initializer` fairing was _not_ attached, the guard _fails_ with
 ///   status `InternalServerError`. A [`Sentinel`] guards this condition, and so
-///   this type of failure is unlikely to occur. A `None` error is returned.
+///   this type of error is unlikely to occur. A `None` error is returned.
 ///   * If a connection is not available within `connect_timeout` seconds or
-///   another error occurs, the gaurd _fails_ with status `ServiceUnavailable`
+///   another error occurs, the guard _fails_ with status `ServiceUnavailable`
 ///   and the error is returned in `Some`.
 ///
 /// ## Deref
@@ -250,7 +248,7 @@ impl<D: Database> Fairing for Initializer<D> {
     fn info(&self) -> Info {
         Info {
             name: self.0.unwrap_or(std::any::type_name::<Self>()),
-            kind: Kind::Ignite,
+            kind: Kind::Ignite | Kind::Shutdown,
         }
     }
 
@@ -261,15 +259,21 @@ impl<D: Database> Fairing for Initializer<D> {
 
         let figment = rocket.figment()
             .focus(&format!("databases.{}", D::NAME))
-            .merge(Serialized::default("max_connections", workers * 4))
-            .merge(Serialized::default("connect_timeout", 5));
+            .join(Serialized::default("max_connections", workers * 4))
+            .join(Serialized::default("connect_timeout", 5));
 
         match <D::Pool>::init(&figment).await {
             Ok(pool) => Ok(rocket.manage(D::from(pool))),
             Err(e) => {
-                error!("failed to initialize database: {}", e);
+                error!("database initialization failed: {e}");
                 Err(rocket)
             }
+        }
+    }
+
+    async fn on_shutdown(&self, rocket: &Rocket<Orbit>) {
+        if let Some(db) = D::fetch(rocket) {
+            db.close().await;
         }
     }
 }
@@ -282,9 +286,9 @@ impl<'r, D: Database> FromRequest<'r> for Connection<D> {
         match D::fetch(req.rocket()) {
             Some(db) => match db.get().await {
                 Ok(conn) => Outcome::Success(Connection(conn)),
-                Err(e) => Outcome::Failure((Status::ServiceUnavailable, Some(e))),
+                Err(e) => Outcome::Error((Status::ServiceUnavailable, Some(e))),
             },
-            None => Outcome::Failure((Status::InternalServerError, None)),
+            None => Outcome::Error((Status::InternalServerError, None)),
         }
     }
 }

@@ -1,16 +1,9 @@
 use std::fmt;
 
-use serde::{de, ser, Deserialize, Serialize};
+use cookie::Key;
+use serde::{de, ser, Deserialize};
 
-use crate::http::private::cookie::Key;
 use crate::request::{Outcome, Request, FromRequest};
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-enum Kind {
-    Zero,
-    Generated,
-    Provided
-}
 
 /// A cryptographically secure secret key.
 ///
@@ -22,8 +15,13 @@ enum Kind {
 /// ```rust
 /// use rocket::config::Config;
 ///
+/// // NOTE: Don't (!) use this key! Generate your own and keep it private!
+/// //       e.g. via `head -c64 /dev/urandom | base64`
 /// let figment = Config::figment()
-///     .merge(("secret_key", "hPRYyVRiMyxpw5sBB1XeCMN1kFsDCqKvBi2QJxBVHQk="));
+///     # .merge(("secret_key", "hPRYyVRiMyxpw5sBB1XeCMN1kFsDCqKvBi2QJxBVHQk="));
+///     # /*
+///     .merge(("secret_key", "hPrYyЭRiMyµ5sBB1π+CMæ1køFsåqKvBiQJxBVHQk="));
+///     # */
 ///
 /// let config = Config::from(figment);
 /// assert!(!config.secret_key.is_zero());
@@ -47,7 +45,7 @@ enum Kind {
 /// ```
 ///
 /// When running in any other profile with the `secrets` feature enabled,
-/// providing a key of `0` or not provided a key at all results in a failure at
+/// providing a key of `0` or not provided a key at all results in an error at
 /// launch-time:
 ///
 /// ```rust
@@ -62,12 +60,12 @@ enum Kind {
 ///     .select(profile.clone());
 ///
 /// let rocket = rocket::custom(figment);
-/// let error = Client::tracked(rocket).expect_err("failure in non-debug");
+/// let error = Client::tracked(rocket).expect_err("error in non-debug");
 /// assert!(matches!(error.kind(), ErrorKind::InsecureSecretKey(profile)));
 /// ```
 ///
-/// [private cookies]: https://rocket.rs/v0.5-rc/guide/requests/#private-cookies
-/// [configuration guide]: https://rocket.rs/v0.5-rc/guide/configuration/#secret-key
+/// [private cookies]: https://rocket.rs/master/guide/requests/#private-cookies
+/// [configuration guide]: https://rocket.rs/master/guide/configuration/#secret-key
 #[derive(Clone)]
 #[cfg_attr(nightly, doc(cfg(feature = "secrets")))]
 pub struct SecretKey {

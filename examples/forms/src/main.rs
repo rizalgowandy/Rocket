@@ -11,7 +11,9 @@ use rocket_dyn_templates::Template;
 struct Password<'v> {
     #[field(validate = len(6..))]
     #[field(validate = eq(self.second))]
+    #[allow(unused)]
     first: &'v str,
+    #[allow(unused)]
     #[field(validate = eq(self.first))]
     second: &'v str,
 }
@@ -33,6 +35,7 @@ enum Category {
 }
 
 #[derive(Debug, FromForm)]
+#[allow(dead_code)]
 struct Submission<'v> {
     #[field(validate = len(1..))]
     title: &'v str,
@@ -48,6 +51,7 @@ struct Submission<'v> {
 }
 
 #[derive(Debug, FromForm)]
+#[allow(dead_code)]
 struct Account<'v> {
     #[field(validate = len(1..))]
     name: &'v str,
@@ -57,6 +61,7 @@ struct Account<'v> {
 }
 
 #[derive(Debug, FromForm)]
+#[allow(dead_code)]
 struct Submit<'v> {
     account: Account<'v>,
     submission: Submission<'v>,
@@ -88,5 +93,5 @@ fn rocket() -> _ {
     rocket::build()
         .mount("/", routes![index, submit])
         .attach(Template::fairing())
-        .mount("/", FileServer::from(relative!("/static")))
+        .mount("/", FileServer::new(relative!("/static")))
 }

@@ -2,7 +2,7 @@
 name = "templating"
 version = "0.0.0"
 workspace = "../"
-edition = "2018"
+edition = "2021"
 publish = false
 
 [dependencies]
@@ -11,4 +11,4 @@ rocket = { path = "../../core/lib" }
 # in your application, you should enable only the template engine(s) used
 [dependencies.rocket_dyn_templates]
 path = "../../contrib/dyn_templates"
-features = ["tera", "handlebars"]
+features = ["tera", "handlebars", "minijinja"]

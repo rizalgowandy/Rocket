@@ -1,15 +1,15 @@
 //! Automatic MessagePack (de)serialization support.
 //!
-//! See [`MsgPack`](crate::serde::msgpack::MsgPack) for further details.
+//! See [`MsgPack`] for further details.
 //!
 //! # Enabling
 //!
-//! This module is only available when the `json` feature is enabled. Enable it
-//! in `Cargo.toml` as follows:
+//! This module is only available when the `msgpack` feature is enabled. Enable
+//! it in `Cargo.toml` as follows:
 //!
 //! ```toml
 //! [dependencies.rocket]
-//! version = "0.5.0-rc.1"
+//! version = "0.6.0-dev"
 //! features = ["msgpack"]
 //! ```
 //!
@@ -43,9 +43,8 @@ pub use rmp_serde::decode::Error;
 ///
 /// ## Sending MessagePack
 ///
-/// To respond with serialized MessagePack data, return a `MsgPack<T>` type,
-/// where `T` implements [`Serialize`] from [`serde`]. The content type of the
-/// response is set to `application/msgpack` automatically.
+/// To respond with serialized MessagePack data, return either [`MsgPack<T>`] or
+/// [`Compact<T>`] from your handler. `T` must implement [`serde::Serialize`].
 ///
 /// ```rust
 /// # #[macro_use] extern crate rocket;
@@ -59,6 +58,10 @@ pub use rmp_serde::decode::Error;
 ///     MsgPack(user_from_id)
 /// }
 /// ```
+///
+/// The differences between [`MsgPack<T>`] and [`Compact<T>`] are documented on
+/// [`Compact<T>`]. In most cases, [`MsgPack<T>`] is preferable, although compact
+/// was the default prior to Rocket version 0.6.
 ///
 /// ## Receiving MessagePack
 ///
@@ -123,9 +126,35 @@ pub use rmp_serde::decode::Error;
 /// msgpack = 5242880
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MsgPack<T>(pub T);
+pub struct MsgPack<T, const COMPACT: bool = false>(pub T);
 
-impl<T> MsgPack<T> {
+/// Serializes responses in a compact MesagePack format, where structs are
+/// serialized as arrays of their field values.
+///
+/// To respond with compact MessagePack data, return a `Compact<T>` type,
+/// where `T` implements [`Serialize`] from [`serde`]. The content type of the
+/// response is set to `application/msgpack` automatically.
+///
+/// ```rust
+/// # #[macro_use] extern crate rocket;
+/// # type User = usize;
+/// use rocket::serde::msgpack;
+///
+/// #[get("/users/<id>")]
+/// fn user(id: usize) -> msgpack::Compact<User> {
+///     let user_from_id = User::from(id);
+///     /* ... */
+///     msgpack::MsgPack(user_from_id)
+/// }
+/// ```
+///
+/// Prefer using [`MsgPack<T>`] for request guards, as the named/compact
+/// distinction is not relevant for request data - the correct option is
+/// implemented automatically. Using [`Compact<T>`] as a request guard will
+/// NOT prevent named requests from being accepted.
+pub type Compact<T> = MsgPack<T, true>;
+
+impl<T, const COMPACT: bool> MsgPack<T, COMPACT> {
     /// Consumes the `MsgPack` wrapper and returns the wrapped item.
     ///
     /// # Example
@@ -133,7 +162,7 @@ impl<T> MsgPack<T> {
     /// ```rust
     /// # use rocket::serde::msgpack::MsgPack;
     /// let string = "Hello".to_string();
-    /// let my_msgpack = MsgPack(string);
+    /// let my_msgpack: MsgPack<_> = MsgPack(string);
     /// assert_eq!(my_msgpack.into_inner(), "Hello".to_string());
     /// ```
     #[inline(always)]
@@ -170,15 +199,15 @@ impl<'r, T: Deserialize<'r>> FromData<'r> for MsgPack<T> {
         match Self::from_data(req, data).await {
             Ok(value) => Outcome::Success(value),
             Err(Error::InvalidDataRead(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                Outcome::Failure((Status::PayloadTooLarge, Error::InvalidDataRead(e)))
+                Outcome::Error((Status::PayloadTooLarge, Error::InvalidDataRead(e)))
             },
             | Err(e@Error::TypeMismatch(_))
             | Err(e@Error::OutOfRange)
             | Err(e@Error::LengthMismatch(_))
             => {
-                Outcome::Failure((Status::UnprocessableEntity, e))
+                Outcome::Error((Status::UnprocessableEntity, e))
             },
-            Err(e) => Outcome::Failure((Status::BadRequest, e)),
+            Err(e) => Outcome::Error((Status::BadRequest, e)),
         }
     }
 }
@@ -186,11 +215,16 @@ impl<'r, T: Deserialize<'r>> FromData<'r> for MsgPack<T> {
 /// Serializes the wrapped value into MessagePack. Returns a response with
 /// Content-Type `MsgPack` and a fixed-size body with the serialization. If
 /// serialization fails, an `Err` of `Status::InternalServerError` is returned.
-impl<'r, T: Serialize> Responder<'r, 'static> for MsgPack<T> {
+impl<'r, T: Serialize, const COMPACT: bool> Responder<'r, 'static> for MsgPack<T, COMPACT> {
     fn respond_to(self, req: &'r Request<'_>) -> response::Result<'static> {
-        let buf = rmp_serde::to_vec(&self.0)
+        let maybe_buf = if COMPACT {
+            rmp_serde::to_vec(&self.0)
+        } else {
+            rmp_serde::to_vec_named(&self.0)
+        };
+        let buf = maybe_buf
             .map_err(|e| {
-                error_!("MsgPack failed to serialize: {:?}", e);
+                error!("MsgPack serialize failure: {}", e);
                 Status::InternalServerError
             })?;
 
@@ -222,13 +256,13 @@ impl<'v, T: Deserialize<'v> + Send> form::FromFormField<'v> for MsgPack<T> {
 //     }
 // }
 
-impl<T> From<T> for MsgPack<T> {
+impl<T, const COMPACT: bool> From<T> for MsgPack<T, COMPACT> {
     fn from(value: T) -> Self {
         MsgPack(value)
     }
 }
 
-impl<T> Deref for MsgPack<T> {
+impl<T, const COMPACT: bool> Deref for MsgPack<T, COMPACT> {
     type Target = T;
 
     #[inline(always)]
@@ -237,7 +271,7 @@ impl<T> Deref for MsgPack<T> {
     }
 }
 
-impl<T> DerefMut for MsgPack<T> {
+impl<T, const COMPACT: bool> DerefMut for MsgPack<T, COMPACT> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut T {
         &mut self.0
@@ -280,14 +314,15 @@ impl<T> DerefMut for MsgPack<T> {
 pub fn from_slice<'a, T>(v: &'a [u8]) -> Result<T, Error>
     where T: Deserialize<'a>,
 {
-    rmp_serde::from_read_ref(v)
+    rmp_serde::from_slice(v)
 }
 
 /// Serialize a `T` into a MessagePack byte vector with compact representation.
 ///
 /// The compact representation represents structs as arrays.
 ///
-/// **_Always_ use [`MsgPack`] to serialize MessagePack response data.**
+/// **_Always_ use [`Compact`] to serialize MessagePack response data in a
+/// compact format.**
 ///
 /// # Example
 ///
